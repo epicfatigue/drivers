@@ -59,26 +59,27 @@ func TestOrbDriver(t *testing.T) {
 	}
 
 	// For 1.8491V:
-	// adc = round(1.8491/3.3 * 16383) = 9180
+	// adc = round(1.8491/3.3 * 16383) = ~9180
 	// raw = adc << 2 = 0x8F70
 	bus.Bytes[0] = 0x8F
 	bus.Bytes[1] = 0x70
 
-	v, err := ch.Value() // voltage
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v < 1.84 || v > 1.86 {
-		t.Errorf("unexpected voltage: %f", v)
-	}
-
-	// Measure should be ~256.0mV when voltage matches reference voltage
-	orp, err := ch.Measure()
+	// Value should be ~256.0mV when voltage matches reference voltage
+	orp, err := ch.Value()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if orp < 255.9 || orp > 256.1 {
-		t.Errorf("unexpected ORP: %f", orp)
+		t.Errorf("unexpected ORP (mV): %f", orp)
+	}
+
+	// Measure should be same as Value (mV)
+	orp2, err := ch.Measure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orp2 < 255.9 || orp2 > 256.1 {
+		t.Errorf("unexpected ORP from Measure (mV): %f", orp2)
 	}
 
 	if err := d.Close(); err != nil {
@@ -129,7 +130,7 @@ func TestCalibrateUpdatesReference(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When voltage == 2.0V, Measure should be ~400mV now
+	// When voltage == 2.0V, Value/Measure should be ~400mV now
 	// Compute bytes for 2.0V: adc ≈ round(2.0/3.3*16383)=9920, raw=9920<<2=0x9B00
 	bus.Bytes[0] = 0x9B
 	bus.Bytes[1] = 0x00
@@ -139,6 +140,6 @@ func TestCalibrateUpdatesReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	if orp < 399.9 || orp > 400.1 {
-		t.Errorf("unexpected ORP after calibrate: %f", orp)
+		t.Errorf("unexpected ORP after calibrate (mV): %f", orp)
 	}
 }
