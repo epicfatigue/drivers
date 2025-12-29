@@ -1,6 +1,7 @@
 package orb
 
 import (
+	"math"
 	"testing"
 
 	"github.com/reef-pi/hal"
@@ -13,6 +14,19 @@ var params = map[string]interface{}{
 	"Vref":          3.3,
 	"ORPRefVoltage": 1.8491,
 	"ORPRefmV":      256.0,
+}
+
+func setBusBytesForVoltage(bus *i2c.MockBus, v float64, adcMax int, vref float64) {
+	adc := int(math.Round((v / vref) * float64(adcMax)))
+	if adc < 0 {
+		adc = 0
+	}
+	if adc > adcMax {
+		adc = adcMax
+	}
+	raw := uint16(adc << 2) // stored left-shifted by 2 bits
+	bus.Bytes[0] = byte(raw >> 8)
+	bus.Bytes[1] = byte(raw & 0xFF)
 }
 
 func TestOrbDriver(t *testing.T) {
@@ -58,28 +72,24 @@ func TestOrbDriver(t *testing.T) {
 		t.Error("unexpected channel name")
 	}
 
-	// For 1.8491V:
-	// adc = round(1.8491/3.3 * 16383) = ~9180
-	// raw = adc << 2 = 0x8F70
-	bus.Bytes[0] = 0x8F
-	bus.Bytes[1] = 0x70
+	// Set bytes to represent ~1.8491V
+	setBusBytesForVoltage(bus, 1.8491, 16383, 3.3)
 
-	// Value should be ~256.0mV when voltage matches reference voltage
-	orp, err := ch.Value()
+	v, err := ch.Value() // voltage
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v < 1.848 || v > 1.851 {
+		t.Errorf("unexpected voltage: %f", v)
+	}
+
+	// Measure should be ~256.0mV when voltage matches reference voltage
+	orp, err := ch.Measure()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if orp < 255.9 || orp > 256.1 {
-		t.Errorf("unexpected ORP (mV): %f", orp)
-	}
-
-	// Measure should be same as Value (mV)
-	orp2, err := ch.Measure()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if orp2 < 255.9 || orp2 > 256.1 {
-		t.Errorf("unexpected ORP from Measure (mV): %f", orp2)
+		t.Errorf("unexpected ORP: %f", orp)
 	}
 
 	if err := d.Close(); err != nil {
@@ -130,16 +140,14 @@ func TestCalibrateUpdatesReference(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When voltage == 2.0V, Value/Measure should be ~400mV now
-	// Compute bytes for 2.0V: adc ≈ round(2.0/3.3*16383)=9920, raw=9920<<2=0x9B00
-	bus.Bytes[0] = 0x9B
-	bus.Bytes[1] = 0x00
+	// Encode bytes for 2.0V *consistently*
+	setBusBytesForVoltage(bus, 2.0, 16383, 3.3)
 
 	orp, err := ch.Measure()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if orp < 399.9 || orp > 400.1 {
-		t.Errorf("unexpected ORP after calibrate (mV): %f", orp)
+		t.Errorf("unexpected ORP after calibrate: %f", orp)
 	}
 }
