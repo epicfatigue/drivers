@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/reef-pi/hal"
 	"github.com/reef-pi/rpi/i2c"
@@ -15,6 +16,7 @@ const (
 	vrefParam          = "Vref"
 	orpRefVoltageParam = "ORPRefVoltage"
 	orpRefmVParam      = "ORPRefmV"
+	delayParamMs       = "DelayMs"
 )
 
 type orbFactory struct {
@@ -30,15 +32,16 @@ func Factory() hal.DriverFactory {
 		factory = &orbFactory{
 			meta: hal.Metadata{
 				Name:         driverName,
-				Description:  "ORB I2C ADC module (14-bit) converted to ORP (mV) using offset calibration",
+				Description:  "ORB I2C ADC -> ORP (mV) driver (14-bit ADC, offset-calibrated)",
 				Capabilities: []hal.Capability{hal.AnalogInput},
 			},
 			parameters: []hal.ConfigParameter{
 				{Name: addressParam, Type: hal.Integer, Order: 0, Default: 0x24},
 				{Name: adcMaxParam, Type: hal.Integer, Order: 1, Default: 16383},
-				{Name: vrefParam, Type: hal.Float, Order: 2, Default: 3.3},
-				{Name: orpRefVoltageParam, Type: hal.Float, Order: 3, Default: 1.8491},
-				{Name: orpRefmVParam, Type: hal.Float, Order: 4, Default: 256.0},
+				{Name: vrefParam, Type: hal.Decimal, Order: 2, Default: 3.3},
+				{Name: orpRefVoltageParam, Type: hal.Decimal, Order: 3, Default: 1.8491},
+				{Name: orpRefmVParam, Type: hal.Decimal, Order: 4, Default: 256.0},
+				{Name: delayParamMs, Type: hal.Integer, Order: 5, Default: 0},
 			},
 		}
 	})
@@ -46,82 +49,73 @@ func Factory() hal.DriverFactory {
 }
 
 func (f *orbFactory) Metadata() hal.Metadata { return f.meta }
-
-func (f *orbFactory) GetParameters() []hal.ConfigParameter { return f.parameters }
+func (f *orbFactory) GetParameters() []hal.ConfigParameter {
+	return f.parameters
+}
 
 func (f *orbFactory) ValidateParameters(parameters map[string]interface{}) (bool, map[string][]string) {
 	failures := make(map[string][]string)
 
-	// Address (required)
+	req := func(name string) {
+		if _, ok := parameters[name]; !ok {
+			failures[name] = append(failures[name], fmt.Sprintf("%s is required but was not received", name))
+		}
+	}
+
+	req(addressParam)
+	req(adcMaxParam)
+	req(vrefParam)
+	req(orpRefVoltageParam)
+	req(orpRefmVParam)
+
+	// Address
 	if v, ok := parameters[addressParam]; ok {
 		val, ok := hal.ConvertToInt(v)
 		if !ok {
-			failures[addressParam] = append(failures[addressParam],
-				fmt.Sprintf("%s is not a number. %v was received.", addressParam, v))
+			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s is not a number. %v was received", addressParam, v))
 		} else if val <= 0 || val >= 256 {
-			failures[addressParam] = append(failures[addressParam],
-				fmt.Sprintf("%s is out of range (1 - 255). %v was received.", addressParam, v))
+			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s out of range (1-255). %v was received", addressParam, v))
 		}
-	} else {
-		failures[addressParam] = append(failures[addressParam],
-			fmt.Sprintf("%s is a required parameter, but was not received.", addressParam))
 	}
 
-	// ADCMax (required)
+	// ADCMax
 	if v, ok := parameters[adcMaxParam]; ok {
 		val, ok := hal.ConvertToInt(v)
-		if !ok {
-			failures[adcMaxParam] = append(failures[adcMaxParam],
-				fmt.Sprintf("%s is not a number. %v was received.", adcMaxParam, v))
-		} else if val <= 0 {
-			failures[adcMaxParam] = append(failures[adcMaxParam],
-				fmt.Sprintf("%s must be > 0. %v was received.", adcMaxParam, v))
+		if !ok || val <= 0 {
+			failures[adcMaxParam] = append(failures[adcMaxParam], fmt.Sprintf("%s must be > 0. %v was received", adcMaxParam, v))
 		}
-	} else {
-		failures[adcMaxParam] = append(failures[adcMaxParam],
-			fmt.Sprintf("%s is a required parameter, but was not received.", adcMaxParam))
 	}
 
-	// Vref (required)
+	// Vref
 	if v, ok := parameters[vrefParam]; ok {
 		val, ok := hal.ConvertToFloat(v)
-		if !ok {
-			failures[vrefParam] = append(failures[vrefParam],
-				fmt.Sprintf("%s is not a number. %v was received.", vrefParam, v))
-		} else if val <= 0 {
-			failures[vrefParam] = append(failures[vrefParam],
-				fmt.Sprintf("%s must be > 0. %v was received.", vrefParam, v))
+		if !ok || val <= 0 {
+			failures[vrefParam] = append(failures[vrefParam], fmt.Sprintf("%s must be > 0. %v was received", vrefParam, v))
 		}
-	} else {
-		failures[vrefParam] = append(failures[vrefParam],
-			fmt.Sprintf("%s is a required parameter, but was not received.", vrefParam))
 	}
 
-	// ORPRefVoltage (required)
+	// ORPRefVoltage
 	if v, ok := parameters[orpRefVoltageParam]; ok {
 		val, ok := hal.ConvertToFloat(v)
-		if !ok {
-			failures[orpRefVoltageParam] = append(failures[orpRefVoltageParam],
-				fmt.Sprintf("%s is not a number. %v was received.", orpRefVoltageParam, v))
-		} else if val <= 0 {
-			failures[orpRefVoltageParam] = append(failures[orpRefVoltageParam],
-				fmt.Sprintf("%s must be > 0. %v was received.", orpRefVoltageParam, v))
+		if !ok || val < 0 {
+			failures[orpRefVoltageParam] = append(failures[orpRefVoltageParam], fmt.Sprintf("%s must be >= 0. %v was received", orpRefVoltageParam, v))
 		}
-	} else {
-		failures[orpRefVoltageParam] = append(failures[orpRefVoltageParam],
-			fmt.Sprintf("%s is a required parameter, but was not received.", orpRefVoltageParam))
 	}
 
-	// ORPRefmV (required)
+	// ORPRefmV
 	if v, ok := parameters[orpRefmVParam]; ok {
 		_, ok := hal.ConvertToFloat(v)
 		if !ok {
-			failures[orpRefmVParam] = append(failures[orpRefmVParam],
-				fmt.Sprintf("%s is not a number. %v was received.", orpRefmVParam, v))
+			failures[orpRefmVParam] = append(failures[orpRefmVParam], fmt.Sprintf("%s is not a number. %v was received", orpRefmVParam, v))
 		}
-	} else {
-		failures[orpRefmVParam] = append(failures[orpRefmVParam],
-			fmt.Sprintf("%s is a required parameter, but was not received.", orpRefmVParam))
+	}
+
+	// DelayMs optional
+	if v, ok := parameters[delayParamMs]; ok {
+		val, ok := hal.ConvertToInt(v)
+		if !ok || val < 0 {
+			failures[delayParamMs] = append(failures[delayParamMs], fmt.Sprintf("%s must be >= 0. %v was received", delayParamMs, v))
+		}
 	}
 
 	return len(failures) == 0, failures
@@ -133,20 +127,28 @@ func (f *orbFactory) NewDriver(parameters map[string]interface{}, hardwareResour
 	}
 
 	intAddress, _ := hal.ConvertToInt(parameters[addressParam])
+	address := byte(intAddress)
+
 	adcMax, _ := hal.ConvertToInt(parameters[adcMaxParam])
 	vref, _ := hal.ConvertToFloat(parameters[vrefParam])
 	orpRefVoltage, _ := hal.ConvertToFloat(parameters[orpRefVoltageParam])
 	orpRefmV, _ := hal.ConvertToFloat(parameters[orpRefmVParam])
 
+	delayMs := 0
+	if v, ok := parameters[delayParamMs]; ok {
+		delayMs, _ = hal.ConvertToInt(v)
+	}
+
 	bus := hardwareResources.(i2c.Bus)
 
-	return &ORB{
-		addr:          byte(intAddress),
+	return &Driver{
+		addr:          address,
 		bus:           bus,
-		meta:          f.meta,
+		delay:         time.Duration(delayMs) * time.Millisecond,
 		adcMax:        adcMax,
 		vref:          vref,
 		orpRefVoltage: orpRefVoltage,
 		orpRefmV:      orpRefmV,
+		meta:          f.meta,
 	}, nil
 }
