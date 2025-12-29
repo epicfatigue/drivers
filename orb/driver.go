@@ -3,107 +3,121 @@ package orb
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/reef-pi/hal"
 	"github.com/reef-pi/rpi/i2c"
 )
 
 const (
-	driverName  = "orb"
-	channelName = "0"
+	driverName = "orb"
+	chName     = "0"
 )
 
-type ORB struct {
-	addr byte
-	bus  i2c.Bus
-	meta hal.Metadata
-
+type Driver struct {
+	addr          byte
+	bus           i2c.Bus
+	delay         time.Duration
 	adcMax        int
 	vref          float64
 	orpRefVoltage float64
 	orpRefmV      float64
+	meta          hal.Metadata
 }
 
-// ----- AnalogInputPin -----
+// readADC reads 2 bytes, converts to 14-bit ADC (>>2), then voltage.
+func (d *Driver) readADC() (int, float64, error) {
+	buf, err := d.bus.ReadBytes(d.addr, 2)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(buf) != 2 {
+		return 0, 0, fmt.Errorf("unexpected ADC length: %d", len(buf))
+	}
 
-func (o *ORB) Name() string { return channelName }
-func (o *ORB) Number() int  { return 0 }
+	// raw is 16-bit container; ADC is top 14 bits (shift right by 2)
+	raw := (int(buf[0]) << 8) | int(buf[1])
+	adc := raw >> 2
 
-func (o *ORB) Value() (float64, error) {
-	// ORB returns 2 bytes. We convert to 14-bit ADC by >> 2.
-	buf, err := o.bus.ReadBytes(o.addr, 2)
+	if adc < 0 || adc > d.adcMax {
+		// Don't hard-fail, but flag weird values
+		return adc, float64(adc) / float64(d.adcMax) * d.vref, nil
+	}
+
+	voltage := (float64(adc) / float64(d.adcMax)) * d.vref
+	return adc, voltage, nil
+}
+
+func (d *Driver) voltageToORPmV(voltage float64) float64 {
+	orp := d.orpRefmV + (voltage-d.orpRefVoltage)*1000.0
+	// keep 0.1mV resolution like your python round(orp, 1)
+	return math.Round(orp*10.0) / 10.0
+}
+
+/*
+hal.Pin / hal.AnalogInputPin
+*/
+
+// Name is the channel name reef-pi expects.
+func (d *Driver) Name() string { return chName }
+func (d *Driver) Number() int  { return 0 }
+
+// Value returns ORP in mV (already converted using current reference point)
+func (d *Driver) Value() (float64, error) {
+	_, v, err := d.readADC()
 	if err != nil {
 		return math.NaN(), err
 	}
-	if len(buf) != 2 {
-		return math.NaN(), fmt.Errorf("unexpected ADC data length: %d", len(buf))
+	if d.delay > 0 {
+		time.Sleep(d.delay)
 	}
-
-	raw := (uint16(buf[0]) << 8) | uint16(buf[1])
-	adc := int(raw >> 2) // 14-bit value
-
-	if o.adcMax <= 0 {
-		return math.NaN(), fmt.Errorf("invalid ADCMax: %d", o.adcMax)
-	}
-	if o.vref <= 0 {
-		return math.NaN(), fmt.Errorf("invalid Vref: %f", o.vref)
-	}
-
-	voltage := (float64(adc) / float64(o.adcMax)) * o.vref
-	return voltage, nil
+	return d.voltageToORPmV(v), nil
 }
 
-func (o *ORB) Measure() (float64, error) {
-	v, err := o.Value()
-	if err != nil {
-		return 0, err
-	}
-	// ORP in mV using offset-based calibration
-	orp := o.orpRefmV + (v-o.orpRefVoltage)*1000.0
-	return orp, nil
+// Measure returns ORP in mV (same as Value)
+func (d *Driver) Measure() (float64, error) {
+	return d.Value()
 }
 
-// Calibrate expects:
-// - Expected: known ORP (mV)
-// - Observed: measured voltage (V)
-func (o *ORB) Calibrate(ms []hal.Measurement) error {
-	if len(ms) == 0 {
+// Calibrate updates the reference point.
+// Convention here:
+//   Expected = known ORP in mV
+//   Observed = measured voltage in V
+func (d *Driver) Calibrate(points []hal.Measurement) error {
+	if len(points) == 0 {
 		return fmt.Errorf("no calibration points provided")
 	}
-	// Use the last point provided
-	m := ms[len(ms)-1]
-
-	if m.Observed <= 0 {
-		return fmt.Errorf("observed voltage must be > 0, got: %f", m.Observed)
-	}
-	// Expected is ORP in mV; allow any float
-	o.orpRefVoltage = m.Observed
-	o.orpRefmV = m.Expected
+	// Use the last point as the active reference (common/expected behavior)
+	p := points[len(points)-1]
+	d.orpRefmV = p.Expected
+	d.orpRefVoltage = p.Observed
 	return nil
 }
 
-func (o *ORB) Close() error { return nil }
+func (d *Driver) Close() error { return nil }
 
-// ----- Driver -----
+/*
+hal.Driver / hal.AnalogInputDriver
+*/
 
-func (o *ORB) Metadata() hal.Metadata { return o.meta }
+func (d *Driver) Metadata() hal.Metadata { return d.meta }
 
-func (o *ORB) Pins(cap hal.Capability) ([]hal.Pin, error) {
+func (d *Driver) Pins(cap hal.Capability) ([]hal.Pin, error) {
 	switch cap {
 	case hal.AnalogInput:
-		return []hal.Pin{o}, nil
+		return []hal.Pin{d}, nil
 	default:
 		return nil, fmt.Errorf("unsupported capability: %s", cap.String())
 	}
 }
 
-func (o *ORB) AnalogInputPin(n int) (hal.AnalogInputPin, error) {
+func (d *Driver) AnalogInputPins() []hal.AnalogInputPin {
+	return []hal.AnalogInputPin{d}
+}
+
+func (d *Driver) AnalogInputPin(n int) (hal.AnalogInputPin, error) {
 	if n != 0 {
 		return nil, fmt.Errorf("orb driver has only one valid channel: 0. Asked:%d", n)
 	}
-	return o, nil
-}
-
-func (o *ORB) AnalogInputPins() []hal.AnalogInputPin {
-	return []hal.AnalogInputPin{o}
+	return d, nil
 }
