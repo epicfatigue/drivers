@@ -1,14 +1,16 @@
 package ads1115tds
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/reef-pi/hal"
 	"github.com/reef-pi/rpi/i2c"
 )
+
+// Toggle this while debugging. Set false once stable.
+var debugADS1115TDS = true
 
 // ADS1115-only TDS channel (single-ended AINx -> raw -> volts -> linear TDS)
 type tdsChannel struct {
@@ -18,7 +20,7 @@ type tdsChannel struct {
 
 	mux        uint16
 	gainConfig uint16
-	delay      time.Duration
+	delay      time.Duration // optional extra delay (can be 0)
 
 	// Conversion knobs
 	vref      float64
@@ -50,6 +52,13 @@ func newTdsChannel(
 	}
 }
 
+func (c *tdsChannel) dbg(format string, args ...any) {
+	if !debugADS1115TDS {
+		return
+	}
+	log.Printf("ads1115tds addr=0x%02X ch=%d: %s", c.address, c.channel, fmt.Sprintf(format, args...))
+}
+
 func (c *tdsChannel) Name() string { return fmt.Sprintf("%d", c.channel) }
 func (c *tdsChannel) Number() int  { return c.channel }
 func (c *tdsChannel) Close() error { return nil }
@@ -63,65 +72,87 @@ func (c *tdsChannel) Value() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Raw code is useful for debugging (reef-pi may call Value() for graphs)
 	return float64(raw), nil
 }
 
-// Measure returns TDS (units depend on your chosen linear conversion).
+// Measure returns a linear conversion of volts: (tdsK*volts)+tdsOffset.
+// (You can set k=1, offset=0 to effectively expose volts.)
 func (c *tdsChannel) Measure() (float64, error) {
 	raw, err := c.performConversion()
 	if err != nil {
 		return 0, err
 	}
+
 	volts, err := c.rawToVolts(raw)
 	if err != nil {
 		return 0, err
 	}
-	return (c.tdsK * volts) + c.tdsOffset, nil
+
+	out := (c.tdsK * volts) + c.tdsOffset
+	c.dbg("raw=%d volts=%.6f out=%.6f (k=%.4f off=%.4f)", raw, volts, out, c.tdsK, c.tdsOffset)
+	return out, nil
 }
 
 func (c *tdsChannel) performConversion() (int16, error) {
 	// Build ADS1115 config (single-shot)
-	config := uint16(configOsSingle |
-		configModeSingle |
-		configComparatorModeTraditional |
-		configComparitorNonLatching |
-		configComparitorPolarityActiveLow |
-		configComparitorQueueNone |
-		c.mux |
-		c.gainConfig |
-		configDataRate860)
+	config := uint16(
+		configOsSingle |
+			configModeSingle |
+			configComparatorModeTraditional |
+			configComparitorNonLatching |
+			configComparitorPolarityActiveLow |
+			configComparitorQueueNone |
+			c.mux |
+			c.gainConfig |
+			configDataRate860,
+	)
 
-	buf := make([]byte, 2)
-	binary.BigEndian.PutUint16(buf, config)
+	c.dbg("write cfg=0x%04X mux=0x%04X gain=0x%04X", config, c.mux, c.gainConfig)
 
-	// Write config
+	// Write config (big-endian)
+	buf := []byte{byte(config >> 8), byte(config)}
 	if err := c.bus.WriteToReg(c.address, regConfig, buf); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ads1115: write config: %w", err)
 	}
 
-	time.Sleep(c.delay)
-
-	// Read back config, ignore OS bit (it changes during conversion)
-	verify := make([]byte, 2)
-	if err := c.bus.ReadFromReg(c.address, regConfig, verify); err != nil {
-		return 0, err
+	// Optional extra delay (in addition to polling)
+	if c.delay > 0 {
+		time.Sleep(c.delay)
 	}
-	written := binary.BigEndian.Uint16(buf)
-	readback := binary.BigEndian.Uint16(verify)
 
-	if (written &^ configOsSingle) != (readback &^ configOsSingle) {
-		return 0, errors.New("ads1115: config mismatch (masked OS bit)")
+	// Wait for conversion complete by polling OS bit (bit 15 goes 1 when done)
+	deadline := time.Now().Add(250 * time.Millisecond)
+	var lastCfg uint16
+
+	for {
+		if time.Now().After(deadline) {
+			c.dbg("timeout waiting for OS bit, last cfg=0x%04X", lastCfg)
+			return 0, fmt.Errorf("ads1115: conversion timeout")
+		}
+
+		verify := make([]byte, 2)
+		if err := c.bus.ReadFromReg(c.address, regConfig, verify); err != nil {
+			return 0, fmt.Errorf("ads1115: read config: %w", err)
+		}
+
+		lastCfg = uint16(verify[0])<<8 | uint16(verify[1])
+		if (lastCfg & 0x8000) != 0 { // OS bit set => done
+			break
+		}
+
+		time.Sleep(2 * time.Millisecond)
 	}
 
 	// Read conversion register
 	b := make([]byte, 2)
 	if err := c.bus.ReadFromReg(c.address, regConversion, b); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ads1115: read conversion: %w", err)
 	}
 
-	// ADS1115: signed 16-bit big-endian
-	v := int16(int16(b[0])<<8 | int16(b[1]))
-	return v, nil
+	raw := int16(uint16(b[0])<<8 | uint16(b[1]))
+	c.dbg("read conv raw=%d (0x%04X)", raw, uint16(raw))
+	return raw, nil
 }
 
 func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
@@ -130,7 +161,7 @@ func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
 		return 0, fmt.Errorf("ads1115: unknown gain config: 0x%04x", c.gainConfig)
 	}
 
-	// ADS1115 full-scale: 32768 counts
+	// ADS1115 full-scale: 32768 counts (signed)
 	volts := (float64(raw) / 32768.0) * fs
 
 	// Optional clamp to supplied Vref
