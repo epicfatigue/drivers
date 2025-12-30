@@ -95,7 +95,6 @@ func (c *tdsChannel) Measure() (float64, error) {
 }
 
 func (c *tdsChannel) performConversion() (int16, error) {
-	// Build ADS1115 config (single-shot)
 	config := uint16(
 		configOsSingle |
 			configModeSingle |
@@ -116,33 +115,9 @@ func (c *tdsChannel) performConversion() (int16, error) {
 		return 0, fmt.Errorf("ads1115: write config: %w", err)
 	}
 
-	// Optional extra delay (in addition to polling)
-	if c.delay > 0 {
-		time.Sleep(c.delay)
-	}
-
-	// Wait for conversion complete by polling OS bit (bit 15 goes 1 when done)
-	deadline := time.Now().Add(250 * time.Millisecond)
-	var lastCfg uint16
-
-	for {
-		if time.Now().After(deadline) {
-			c.dbg("timeout waiting for OS bit, last cfg=0x%04X", lastCfg)
-			return 0, fmt.Errorf("ads1115: conversion timeout")
-		}
-
-		verify := make([]byte, 2)
-		if err := c.bus.ReadFromReg(c.address, regConfig, verify); err != nil {
-			return 0, fmt.Errorf("ads1115: read config: %w", err)
-		}
-
-		lastCfg = uint16(verify[0])<<8 | uint16(verify[1])
-		if (lastCfg & 0x8000) != 0 { // OS bit set => done
-			break
-		}
-
-		time.Sleep(2 * time.Millisecond)
-	}
+	// ADS1115 @ 860 SPS max conversion time ≈ 1.2 ms
+	// Give it plenty of margin
+	time.Sleep(3 * time.Millisecond)
 
 	// Read conversion register
 	b := make([]byte, 2)
@@ -154,6 +129,7 @@ func (c *tdsChannel) performConversion() (int16, error) {
 	c.dbg("read conv raw=%d (0x%04X)", raw, uint16(raw))
 	return raw, nil
 }
+
 
 func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
 	fs, ok := fsVoltsForGain(c.gainConfig)
