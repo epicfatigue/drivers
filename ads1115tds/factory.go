@@ -1,7 +1,6 @@
 package ads1115tds
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -11,193 +10,264 @@ import (
 )
 
 const (
-	addressParam   = "Address"
-	delayMsParam   = "DelayMs"
-	vrefParam      = "Vref"
-	tdsKParam      = "TdsK"
-	tdsOffsetParam = "TdsOffset"
+	paramBus      = "Bus"      // i2c bus number (usually 1)
+	paramAddress  = "Address"  // i2c address (decimal, e.g. 72) or hex string (e.g. "0x48")
+	paramChannel  = "Channel"  // 0..3 for A0..A3
+	paramGain     = "Gain"     // "2/3","1","2","4","8","16" OR numeric 0..5 (advanced)
+	paramDelayMs  = "DelayMs"  // conversion wait in ms
+	paramVref     = "Vref"     // optional clamp
+	paramTdsK     = "TdsK"     // linear slope
+	paramTdsOff   = "TdsOffset"
 )
 
-var channelMux = [4]uint16{configMuxSingle0, configMuxSingle1, configMuxSingle2, configMuxSingle3}
-var channelGains = [4]string{"Gain 1", "Gain 2", "Gain 3", "Gain 4"}
+type factory struct{}
 
-var gainOptions = map[string]uint16{
-	"2/3": configGainTwoThirds,
-	"1":   configGainOne,
-	"2":   configGainTwo,
-	"4":   configGainFour,
-	"8":   configGainEight,
-	"16":  configGainSixteen,
-}
+func Factory() hal.DriverFactory { return &factory{} }
 
-type ads1115TdsFactory struct {
-	meta       hal.Metadata
-	parameters []hal.ConfigParameter
-}
-
-func Factory() hal.DriverFactory {
-	f := &ads1115TdsFactory{
-		meta: hal.Metadata{
-			Name:        "ads1115-tds",
-			Description: "ADS1115 analog input driver for TDS/Salinity boards (linear K + offset conversion)",
-			Capabilities: []hal.Capability{
-				hal.AnalogInput,
-			},
+func (f *factory) Metadata() hal.Metadata {
+	return hal.Metadata{
+		Name:        "ads1115-tds",
+		Description: "ADS1115 analog TDS driver (single channel, linear volts->tds)",
+		Capabilities: []hal.Capability{
+			hal.AnalogInput,
 		},
 	}
+}
 
-	f.parameters = []hal.ConfigParameter{
-		{Name: addressParam, Type: hal.Number, Order: 0, Default: 0x48},
-		{Name: delayMsParam, Type: hal.Number, Order: 1, Default: 2}, // safe at 860 SPS
-		{Name: vrefParam, Type: hal.Float, Order: 2, Default: 3.3},
-		{Name: tdsKParam, Type: hal.Float, Order: 3, Default: 1.0},
-		{Name: tdsOffsetParam, Type: hal.Float, Order: 4, Default: 0.0},
+func (f *factory) GetParameters() []hal.ConfigParameter {
+	return []hal.ConfigParameter{
+		{Name: paramBus, Type: hal.Integer, Order: 0, Default: 1},
+		{Name: paramAddress, Type: hal.String, Order: 1, Default: "0x48"},
+		{Name: paramChannel, Type: hal.Integer, Order: 2, Default: 0},
+		{Name: paramGain, Type: hal.String, Order: 3, Default: "1"}, // +/-4.096
+		{Name: paramDelayMs, Type: hal.Integer, Order: 4, Default: 10},
+		{Name: paramVref, Type: hal.Decimal, Order: 5, Default: 3.3},
+		{Name: paramTdsK, Type: hal.Decimal, Order: 6, Default: 1.0},
+		{Name: paramTdsOff, Type: hal.Decimal, Order: 7, Default: 0.0},
 	}
-
-	// Per-channel gain (so you can use any AINx)
-	for i, name := range channelGains {
-		f.parameters = append(f.parameters, hal.ConfigParameter{
-			Name:    name,
-			Type:    hal.String,
-			Order:   5 + i,
-			Default: "2/3",
-		})
-	}
-
-	return f
 }
 
-func (f *ads1115TdsFactory) Metadata() hal.Metadata {
-	return f.meta
-}
+func (f *factory) ValidateParameters(p map[string]interface{}) (bool, map[string][]string) {
+	fail := map[string][]string{}
 
-func (f *ads1115TdsFactory) GetParameters() []hal.ConfigParameter {
-	return f.parameters
-}
-
-func (f *ads1115TdsFactory) ValidateParameters(parameters map[string]interface{}) (bool, map[string][]string) {
-	failures := make(map[string][]string)
-
-	// Address
-	v, ok := parameters[addressParam]
-	if !ok {
-		failures[addressParam] = append(failures[addressParam], addressParam+" is required.")
-	} else {
-		val, ok := hal.ConvertToInt(v)
-		if !ok {
-			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s must be a number, got: %v", addressParam, v))
-		} else if val.(int) <= 0 || val.(int) >= 128 {
-			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s out of range (1-127), got: %v", addressParam, v))
+	// bus
+	if v, ok := p[paramBus]; ok {
+		if i, ok2 := hal.ConvertToInt(v); !ok2 || i <= 0 {
+			fail[paramBus] = append(fail[paramBus], "must be a positive integer")
 		}
 	}
 
-	// DelayMs
-	if v, ok := parameters[delayMsParam]; ok {
-		val, ok := hal.ConvertToInt(v)
-		if !ok || val.(int) < 0 || val.(int) > 500 {
-			failures[delayMsParam] = append(failures[delayMsParam], fmt.Sprintf("%s must be 0..500, got: %v", delayMsParam, v))
+	// address
+	if v, ok := p[paramAddress]; ok {
+		if _, err := parseI2CAddress(v); err != nil {
+			fail[paramAddress] = append(fail[paramAddress], err.Error())
 		}
 	}
 
-	// Vref, TdsK, TdsOffset (just validate they parse as float)
-	for _, p := range []string{vrefParam, tdsKParam, tdsOffsetParam} {
-		if v, ok := parameters[p]; ok {
-			if _, ok := hal.ConvertToFloat(v); !ok {
-				failures[p] = append(failures[p], fmt.Sprintf("%s must be a float, got: %v", p, v))
+	// channel
+	if v, ok := p[paramChannel]; ok {
+		i, ok2 := hal.ConvertToInt(v)
+		if !ok2 || i < 0 || i > 3 {
+			fail[paramChannel] = append(fail[paramChannel], "must be 0..3 (A0..A3)")
+		}
+	}
+
+	// gain
+	if v, ok := p[paramGain]; ok {
+		if _, err := parseGain(v); err != nil {
+			fail[paramGain] = append(fail[paramGain], err.Error())
+		}
+	}
+
+	// delay
+	if v, ok := p[paramDelayMs]; ok {
+		i, ok2 := hal.ConvertToInt(v)
+		if !ok2 || i < 0 {
+			fail[paramDelayMs] = append(fail[paramDelayMs], "must be >= 0")
+		}
+	}
+
+	// decimals
+	for _, k := range []string{paramVref, paramTdsK, paramTdsOff} {
+		if v, ok := p[k]; ok {
+			if _, err := convertToFloat(v); err != nil {
+				fail[k] = append(fail[k], "must be a decimal number")
 			}
 		}
 	}
 
-	// Gains
-	for _, gname := range channelGains {
-		v, ok := parameters[gname]
-		if !ok {
-			failures[gname] = append(failures[gname], gname+" is required.")
-			continue
-		}
-		gs, err := parseGain(v)
-		if err != nil {
-			failures[gname] = append(failures[gname], gname+err.Error())
-			continue
-		}
-		if _, ok := gainOptions[gs]; !ok {
-			failures[gname] = append(failures[gname], fmt.Sprintf("%s invalid (use 2/3,1,2,4,8,16), got: %v", gname, v))
-		}
-	}
-
-	return len(failures) == 0, failures
+	return len(fail) == 0, fail
 }
 
-func parseGain(v interface{}) (string, error) {
-	// UI often passes strings, but sometimes numbers
-	if s, ok := v.(string); ok {
-		return s, nil
-	}
-	if iv, ok := hal.ConvertToInt(v); ok {
-		return strconv.Itoa(iv.(int)), nil
-	}
-	return "", fmt.Errorf(" must be a string or number, got: %T", v)
-}
-
-func (f *ads1115TdsFactory) NewDriver(parameters map[string]interface{}, hardwareResources interface{}) (hal.Driver, error) {
-	if valid, failures := f.ValidateParameters(parameters); !valid {
-		return nil, errors.New(hal.ToErrorString(failures))
+func (f *factory) NewDriver(parameters map[string]interface{}, _ interface{}) (hal.Driver, error) {
+	ok, failures := f.ValidateParameters(parameters)
+	if !ok {
+		return nil, fmt.Errorf("invalid parameters: %s", hal.ToErrorString(failures))
 	}
 
-	bus := hardwareResources.(i2c.Bus)
+	// bus
+	busNum := 1
+	if v, ok := parameters[paramBus]; ok {
+		if i, ok2 := hal.ConvertToInt(v); ok2 {
+			busNum = i
+		}
+	}
 
-	intAddress, _ := hal.ConvertToInt(parameters[addressParam])
-	address := byte(intAddress.(int))
-
-	// Confirm device responds
-	var tmp [2]byte
-	if err := bus.ReadFromReg(address, regConfig, tmp[:]); err != nil {
+	// address
+	addr, err := parseI2CAddress(parameters[paramAddress])
+	if err != nil {
 		return nil, err
 	}
 
-	// Delay
-	delayMs := 2
-	if v, ok := parameters[delayMsParam]; ok {
-		if iv, ok := hal.ConvertToInt(v); ok {
-			delayMs = iv.(int)
+	// channel -> mux
+	ch := 0
+	if v, ok := parameters[paramChannel]; ok {
+		if i, ok2 := hal.ConvertToInt(v); ok2 {
+			ch = i
+		}
+	}
+	mux, _ := muxForChannel(ch)
+
+	// gain
+	gain, err := parseGain(parameters[paramGain])
+	if err != nil {
+		return nil, err
+	}
+
+	// delay
+	delayMs := 10
+	if v, ok := parameters[paramDelayMs]; ok {
+		if i, ok2 := hal.ConvertToInt(v); ok2 {
+			delayMs = i
 		}
 	}
 	delay := time.Duration(delayMs) * time.Millisecond
 
-	// Knobs
-	vf, _ := hal.ConvertToFloat(parameters[vrefParam])
-	kf, _ := hal.ConvertToFloat(parameters[tdsKParam])
-	of, _ := hal.ConvertToFloat(parameters[tdsOffsetParam])
+	// floats
+	vref, _ := convertToFloat(parameters[paramVref])
+	tdsK, _ := convertToFloat(parameters[paramTdsK])
+	tdsOff, _ := convertToFloat(parameters[paramTdsOff])
 
-	vref := vf.(float64)
-	tdsK := kf.(float64)
-	tdsOffset := of.(float64)
-
-	d := driver{
-		meta:     f.meta,
-		channels: []hal.AnalogInputPin{},
+	// Open i2c bus
+	bus, err := i2c.New(busNum)
+	if err != nil {
+		return nil, err
 	}
 
-	for i, mux := range channelMux {
-		gainStr, _ := parseGain(parameters[channelGains[i]])
-		gainCfg := gainOptions[gainStr]
+	d := &Driver{
+		bus:     bus,
+		address: addr,
+		channels: []*tdsChannel{
+			newTdsChannel(bus, addr, ch, mux, gain, delay, vref, tdsK, tdsOff),
+		},
+	}
+	return d, nil
+}
 
-		ch, err := newTdsChannel(
-			bus,
-			address,
-			i,
-			mux,
-			gainCfg,
-			delay,
-			vref,
-			tdsK,
-			tdsOffset,
-		)
-		if err != nil {
-			return nil, err
+func parseI2CAddress(v interface{}) (byte, error) {
+	switch t := v.(type) {
+	case string:
+		s := t
+		base := 10
+		if len(s) > 2 && (s[0:2] == "0x" || s[0:2] == "0X") {
+			base = 0
 		}
-		d.channels = append(d.channels, ch)
+		n64, err := strconv.ParseInt(s, base, 32)
+		if err != nil {
+			return 0, fmt.Errorf("Address must be int or hex string like 0x48: %v", err)
+		}
+		if n64 < 0 || n64 > 127 {
+			return 0, fmt.Errorf("Address out of range (0..127): %d", n64)
+		}
+		return byte(n64), nil
+	default:
+		if i, ok := hal.ConvertToInt(v); ok {
+			if i < 0 || i > 127 {
+				return 0, fmt.Errorf("Address out of range (0..127): %d", i)
+			}
+			return byte(i), nil
+		}
+		return 0, fmt.Errorf("Address must be int or hex string like 0x48")
+	}
+}
+
+func parseGain(v interface{}) (uint16, error) {
+	// Accept a friendly string: "2/3","1","2","4","8","16"
+	if s, ok := v.(string); ok {
+		switch s {
+		case "2/3", "0", "0.666", "0.67":
+			return configGainTwoThirds, nil
+		case "1":
+			return configGainOne, nil
+		case "2":
+			return configGainTwo, nil
+		case "4":
+			return configGainFour, nil
+		case "8":
+			return configGainEight, nil
+		case "16":
+			return configGainSixteen, nil
+		default:
+			// allow "0..5" as string
+			if n, err := strconv.Atoi(s); err == nil {
+				return parseGain(n)
+			}
+			return 0, fmt.Errorf("Gain must be one of: 2/3,1,2,4,8,16")
+		}
 	}
 
-	return &d, nil
+	// Or accept an int (advanced): 0..5 mapping
+	if n, ok := hal.ConvertToInt(v); ok {
+		switch n {
+		case 0:
+			return configGainTwoThirds, nil
+		case 1:
+			return configGainOne, nil
+		case 2:
+			return configGainTwo, nil
+		case 3:
+			return configGainFour, nil
+		case 4:
+			return configGainEight, nil
+		case 5:
+			return configGainSixteen, nil
+		default:
+			return 0, fmt.Errorf("Gain int must be 0..5")
+		}
+	}
+
+	return 0, fmt.Errorf("Gain must be string (2/3,1,2,4,8,16) or int (0..5)")
+}
+
+func convertToFloat(v interface{}) (float64, error) {
+	switch t := v.(type) {
+	case float64:
+		return t, nil
+	case float32:
+		return float64(t), nil
+	case int:
+		return float64(t), nil
+	case int64:
+		return float64(t), nil
+	case jsonNumber:
+		return t.Float64()
+	case string:
+		f, err := strconv.ParseFloat(t, 64)
+		if err != nil {
+			return 0, err
+		}
+		return f, nil
+	default:
+		// some JSON libs may use int via interface{}, hal doesn't provide ConvertToFloat
+		if i, ok := hal.ConvertToInt(v); ok {
+			return float64(i), nil
+		}
+		return 0, fmt.Errorf("not a number")
+	}
+}
+
+// tiny shim so we don't hard-depend on encoding/json here;
+// if the value happens to be json.Number, it will satisfy this.
+type jsonNumber interface {
+	Float64() (float64, error)
 }
