@@ -4,32 +4,22 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/reef-pi/hal"
 	"github.com/reef-pi/rpi/i2c"
 )
 
-// ADS1115-only analog input pin that reports:
-//   Value()   -> raw ADC code (int16 as float64)
-//   Measure() -> "TDS" computed as: TDS = (TdsK * Volts) + TdsOffset
-//
-// Temperature compensation can be added later by adjusting the voltage->TDS mapping.
+// ADS1115-only TDS channel (single-ended voltage -> TDS via K + offset)
 type tdsChannel struct {
-	bus     i2c.Bus
-	busMu   *sync.Mutex
-	address byte
-
+	bus        i2c.Bus
+	address    byte
+	mux        uint16
 	channel    int
-	muxConfig  uint16
 	gainConfig uint16
+	delay      time.Duration
 
-	// conversion behaviour
-	dataRate uint16
-	delay    time.Duration
-
-	// conversion knobs
+	// Conversion knobs
 	vref      float64
 	tdsK      float64
 	tdsOffset float64
@@ -37,31 +27,21 @@ type tdsChannel struct {
 
 func newTdsChannel(
 	b i2c.Bus,
-	busMu *sync.Mutex,
 	address byte,
 	channelNum int,
 	mux uint16,
 	gain uint16,
-	dataRate uint16,
 	delay time.Duration,
 	vref float64,
 	tdsK float64,
 	tdsOffset float64,
 ) (*tdsChannel, error) {
-	if channelNum < 0 || channelNum > 3 {
-		return nil, fmt.Errorf("ads1115: invalid channel %d", channelNum)
-	}
-	if busMu == nil {
-		busMu = &sync.Mutex{}
-	}
 	return &tdsChannel{
 		bus:        b,
-		busMu:      busMu,
 		address:    address,
+		mux:        mux,
 		channel:    channelNum,
-		muxConfig:  mux,
 		gainConfig: gain,
-		dataRate:   dataRate,
 		delay:      delay,
 		vref:       vref,
 		tdsK:       tdsK,
@@ -73,10 +53,10 @@ func (c *tdsChannel) Name() string { return fmt.Sprintf("%d", c.channel) }
 func (c *tdsChannel) Number() int  { return c.channel }
 func (c *tdsChannel) Close() error { return nil }
 
-// We’re using TdsK/TdsOffset as the calibration knobs for now.
+// No point-calibration for now (you’re using K/Offset knobs)
 func (c *tdsChannel) Calibrate(points []hal.Measurement) error { return nil }
 
-// Value returns RAW ADC code (signed 16-bit) as float64.
+// Value returns RAW ADC code (signed int16) as float64 for debugging.
 func (c *tdsChannel) Value() (float64, error) {
 	raw, err := c.performConversion()
 	if err != nil {
@@ -85,7 +65,7 @@ func (c *tdsChannel) Value() (float64, error) {
 	return float64(raw), nil
 }
 
-// Measure returns the derived TDS value using the linear mapping.
+// Measure returns "TDS" (whatever units your K/offset imply).
 func (c *tdsChannel) Measure() (float64, error) {
 	raw, err := c.performConversion()
 	if err != nil {
@@ -97,68 +77,58 @@ func (c *tdsChannel) Measure() (float64, error) {
 		return 0, err
 	}
 
-	// Clamp to sane range for single-ended “voltage” readings
-	if volts < 0 {
-		volts = 0
-	}
-	if c.vref > 0 && volts > c.vref {
-		volts = c.vref
-	}
-
+	// Simple linear conversion for now:
+	// TDS = K * volts + offset
 	return (c.tdsK * volts) + c.tdsOffset, nil
 }
 
 func (c *tdsChannel) performConversion() (int16, error) {
-	// ADS1115 single-shot, no comparator.
-	// NOTE: configOsSingle is a “start conversion” bit in single-shot mode.
-	config := configOsSingle |
-		c.muxConfig |
-		c.gainConfig |
-		configModeSingle |
-		c.dataRate |
-		configComparatorModeTraditional |
-		configComparatorNonLatching |
-		configComparatorPolarityActiveLow |
-		configComparatorQueueNone
-
-	var cfg [2]byte
-	binary.BigEndian.PutUint16(cfg[:], config)
-
-	c.busMu.Lock()
-	defer c.busMu.Unlock()
+	// Build ADS1115 config word
+	config := uint16(0)
+	config |= configOsSingle
+	config |= c.mux
+	config |= c.gainConfig
+	config |= configModeSingle
+	config |= configDataRate860
+	config |= configComparatorModeTraditional
+	config |= configComparitorNonLatching
+	config |= configComparitorPolarityActiveLow
+	config |= configComparitorQueueNone
 
 	// Write config
-	if err := c.bus.WriteToReg(c.address, regConfig, cfg[:]); err != nil {
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], config)
+	if err := c.bus.WriteToReg(c.address, regConfig, buf[:]); err != nil {
 		return 0, err
 	}
 
+	// Wait for conversion (simple + reliable)
 	time.Sleep(c.delay)
 
-	// Optional safety: read-back config, but OS bit can change, so mask it out.
+	// Optional sanity check: read back config but ignore OS bit (it changes during conversion)
 	var verify [2]byte
 	if err := c.bus.ReadFromReg(c.address, regConfig, verify[:]); err != nil {
 		return 0, err
 	}
-	written := binary.BigEndian.Uint16(cfg[:])
+	written := binary.BigEndian.Uint16(buf[:])
 	readback := binary.BigEndian.Uint16(verify[:])
-
 	if (written &^ configOsSingle) != (readback &^ configOsSingle) {
-		return 0, errors.New("ads1115: config mismatch (masked OS bit)")
+		return 0, errors.New("ads1115 config mismatch (masked OS bit)")
 	}
 
 	// Read conversion
-	var b [2]byte
-	if err := c.bus.ReadFromReg(c.address, regConversion, b[:]); err != nil {
+	var out [2]byte
+	if err := c.bus.ReadFromReg(c.address, regConversion, out[:]); err != nil {
 		return 0, err
 	}
 
-	// Signed 16-bit big-endian
-	raw := int16(int16(b[0])<<8 | int16(b[1]))
+	// ADS1115 conversion register is signed big-endian
+	raw := int16(int16(out[0])<<8 | int16(out[1]))
 	return raw, nil
 }
 
 func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
-	// PGA full-scale voltage
+	// Full-scale voltage depends on gain setting
 	var fs float64
 	switch c.gainConfig {
 	case configGainTwoThirds:
@@ -174,9 +144,20 @@ func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
 	case configGainSixteen:
 		fs = 0.256
 	default:
-		return 0, fmt.Errorf("ads1115: unknown gain config: 0x%04x", c.gainConfig)
+		return 0, fmt.Errorf("unknown gain config: 0x%04x", c.gainConfig)
 	}
 
-	// ADS1115 uses 16-bit signed; full scale corresponds to 32768 counts.
-	return (float64(raw) / 32768.0) * fs, nil
+	// ADS1115: signed 16-bit where full-scale is 32768 counts
+	volts := (float64(raw) / 32768.0) * fs
+
+	// Single-ended should not be negative; clamp small negative noise.
+	if volts < 0 {
+		volts = 0
+	}
+
+	// Optional clamp to Vref if provided (helps if frontend cannot exceed Vref)
+	if c.vref > 0 && volts > c.vref {
+		volts = c.vref
+	}
+	return volts, nil
 }

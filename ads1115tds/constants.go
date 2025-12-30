@@ -6,60 +6,34 @@ const (
 	regConfig     = 0x01
 )
 
-// ADS1115 config bits
+// Config register bitfields (ADS1115)
 const (
-	// Operational status / single-shot start
-	configOsSingle  = 0x8000
-	configOsBusy    = 0x0000
-	configOsNotBusy = 0x8000
+	// OS bit (start single conversion)
+	configOsSingle = 0x8000
 
-	// Input mux (single-ended)
-	configMuxSingle0 = 0x4000
-	configMuxSingle1 = 0x5000
-	configMuxSingle2 = 0x6000
-	configMuxSingle3 = 0x7000
+	// MUX single-ended (AINx vs GND)
+	configMuxSingle0 = 0x4000 // 100 << 12
+	configMuxSingle1 = 0x5000 // 101 << 12
+	configMuxSingle2 = 0x6000 // 110 << 12
+	configMuxSingle3 = 0x7000 // 111 << 12
 
-	// PGA gain
-	configGainTwoThirds = 0x0000 // +/- 6.144V
-	configGainOne       = 0x0200 // +/- 4.096V
-	configGainTwo       = 0x0400 // +/- 2.048V
-	configGainFour      = 0x0600 // +/- 1.024V
-	configGainEight     = 0x0800 // +/- 0.512V
-	configGainSixteen   = 0x0A00 // +/- 0.256V
+	// PGA (gain) bits
+	configGainTwoThirds = 0x0000 // +/-6.144V
+	configGainOne       = 0x0200 // +/-4.096V
+	configGainTwo       = 0x0400 // +/-2.048V
+	configGainFour      = 0x0600 // +/-1.024V
+	configGainEight     = 0x0800 // +/-0.512V
+	configGainSixteen   = 0x0A00 // +/-0.256V
 
 	// Mode
-	configModeContinuous = 0x0000
-	configModeSingle     = 0x0100
+	configModeSingle = 0x0100 // single-shot
 
-	// Data rate (ADS1115)
-	configDataRate8    = 0x0000
-	configDataRate16   = 0x0020
-	configDataRate32   = 0x0040
-	configDataRate64   = 0x0060
-	configDataRate128  = 0x0080
-	configDataRate250  = 0x00A0
-	configDataRate475  = 0x00C0
-	configDataRate860  = 0x00E0
+	// Data rate (ADS1115 max is 860 SPS)
+	configDataRate860 = 0x00E0 // 111 << 5
 
-	// Comparator (we disable it)
-	configComparatorModeTraditional = 0x0000
-	configComparatorModeWindow      = 0x0010
-
-	configComparatorPolarityActiveLow  = 0x0000
-	configComparatorPolarityActiveHigh = 0x0008
-
-	configComparatorNonLatching = 0x0000
-	configComparatorLatching    = 0x0004
-
-	configComparatorQueue1    = 0x0000
-	configComparatorQueue2    = 0x0001
-	configComparatorQueue4    = 0x0002
-	configComparatorQueueNone = 0x0003
+	// Comparator (disabled)
+	configComparatorModeTraditional       = 0x0000
+	configComparitorNonLatching           = 0x0000
+	configComparitorPolarityActiveLow     = 0x0000
+	configComparitorQueueNone             = 0x0003 // disable comparator
 )
-
-var channelMux = [4]uint16{
-	configMuxSingle0,
-	configMuxSingle1,
-	configMuxSingle2,
-	configMuxSingle3,
-}

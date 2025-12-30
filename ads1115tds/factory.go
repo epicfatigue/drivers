@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/reef-pi/hal"
@@ -13,18 +12,14 @@ import (
 
 const (
 	addressParam   = "Address"
+	delayMsParam   = "DelayMs"
 	vrefParam      = "Vref"
 	tdsKParam      = "TdsK"
 	tdsOffsetParam = "TdsOffset"
-
-	// Keep these simple; reef-pi stores config as strings nicely
-	gain0Param = "Gain A0"
-	gain1Param = "Gain A1"
-	gain2Param = "Gain A2"
-	gain3Param = "Gain A3"
 )
 
-var gainParams = []string{gain0Param, gain1Param, gain2Param, gain3Param}
+var channelMux = [4]uint16{configMuxSingle0, configMuxSingle1, configMuxSingle2, configMuxSingle3}
+var channelGains = [4]string{"Gain 1", "Gain 2", "Gain 3", "Gain 4"}
 
 var gainOptions = map[string]uint16{
 	"2/3": configGainTwoThirds,
@@ -40,89 +35,93 @@ type ads1115TdsFactory struct {
 	parameters []hal.ConfigParameter
 }
 
-var (
-	factoryInstance *ads1115TdsFactory
-	factoryOnce     sync.Once
-)
-
-// Ads1115TdsFactory returns the driver factory (reef-pi expects factories for UI + driver creation).
-func Ads1115TdsFactory() hal.DriverFactory {
-	factoryOnce.Do(func() {
-		factoryInstance = &ads1115TdsFactory{
-			meta: hal.Metadata{
-				Name:         "ADS1115-TDS",
-				Description:  "ADS1115 analog input (A0-A3) with basic TDS conversion on Measure()",
-				Capabilities: []hal.Capability{hal.AnalogInput},
+func Factory() hal.DriverFactory {
+	f := &ads1115TdsFactory{
+		meta: hal.Metadata{
+			Name:        "ads1115-tds",
+			Description: "ADS1115 analog input driver for TDS/Salinity boards (linear K + offset conversion)",
+			Capabilities: []hal.Capability{
+				hal.AnalogInput,
 			},
-		}
-		factoryInstance.appendParameters()
-	})
-	return factoryInstance
+		},
+	}
+
+	f.parameters = []hal.ConfigParameter{
+		{Name: addressParam, Type: hal.Number, Order: 0, Default: 0x48},
+		{Name: delayMsParam, Type: hal.Number, Order: 1, Default: 2}, // safe at 860 SPS
+		{Name: vrefParam, Type: hal.Float, Order: 2, Default: 3.3},
+		{Name: tdsKParam, Type: hal.Float, Order: 3, Default: 1.0},
+		{Name: tdsOffsetParam, Type: hal.Float, Order: 4, Default: 0.0},
+	}
+
+	// Per-channel gain (so you can use any AINx)
+	for i, name := range channelGains {
+		f.parameters = append(f.parameters, hal.ConfigParameter{
+			Name:    name,
+			Type:    hal.String,
+			Order:   5 + i,
+			Default: "2/3",
+		})
+	}
+
+	return f
 }
 
-func (f *ads1115TdsFactory) Metadata() hal.Metadata { return f.meta }
+func (f *ads1115TdsFactory) Metadata() hal.Metadata {
+	return f.meta
+}
+
 func (f *ads1115TdsFactory) GetParameters() []hal.ConfigParameter {
 	return f.parameters
-}
-
-func (f *ads1115TdsFactory) appendParameters() {
-	f.parameters = []hal.ConfigParameter{
-		{Name: addressParam, Type: hal.Integer, Order: 0, Default: 0x48},
-		{Name: vrefParam, Type: hal.Float, Order: 1, Default: 3.3},
-		{Name: tdsKParam, Type: hal.Float, Order: 2, Default: 1.0},
-		{Name: tdsOffsetParam, Type: hal.Float, Order: 3, Default: 0.0},
-		{Name: gain0Param, Type: hal.String, Order: 4, Default: "1"},
-		{Name: gain1Param, Type: hal.String, Order: 5, Default: "1"},
-		{Name: gain2Param, Type: hal.String, Order: 6, Default: "1"},
-		{Name: gain3Param, Type: hal.String, Order: 7, Default: "1"},
-	}
 }
 
 func (f *ads1115TdsFactory) ValidateParameters(parameters map[string]interface{}) (bool, map[string][]string) {
 	failures := make(map[string][]string)
 
 	// Address
-	if v, ok := parameters[addressParam]; !ok {
-		failures[addressParam] = append(failures[addressParam], "Address is required.")
-	} else if val, ok := hal.ConvertToInt(v); !ok {
-		failures[addressParam] = append(failures[addressParam], fmt.Sprintf("Address must be an integer, got %v.", v))
+	v, ok := parameters[addressParam]
+	if !ok {
+		failures[addressParam] = append(failures[addressParam], addressParam+" is required.")
 	} else {
-		addr := val.(int)
-		if addr < 1 || addr > 0x7F { // i2c 7-bit typical range; reef-pi used 1..255 earlier, but 7-bit is safer
-			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("Address out of range (1-127), got %d.", addr))
+		val, ok := hal.ConvertToInt(v)
+		if !ok {
+			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s must be a number, got: %v", addressParam, v))
+		} else if val.(int) <= 0 || val.(int) >= 128 {
+			failures[addressParam] = append(failures[addressParam], fmt.Sprintf("%s out of range (1-127), got: %v", addressParam, v))
 		}
 	}
 
-	// Vref
-	if v, ok := parameters[vrefParam]; !ok {
-		failures[vrefParam] = append(failures[vrefParam], "Vref is required.")
-	} else if val, ok := hal.ConvertToFloat(v); !ok {
-		failures[vrefParam] = append(failures[vrefParam], fmt.Sprintf("Vref must be a number, got %v.", v))
-	} else if vf := val.(float64); vf <= 0 || vf > 6.144 {
-		failures[vrefParam] = append(failures[vrefParam], fmt.Sprintf("Vref out of range (0-6.144), got %v.", vf))
+	// DelayMs
+	if v, ok := parameters[delayMsParam]; ok {
+		val, ok := hal.ConvertToInt(v)
+		if !ok || val.(int) < 0 || val.(int) > 500 {
+			failures[delayMsParam] = append(failures[delayMsParam], fmt.Sprintf("%s must be 0..500, got: %v", delayMsParam, v))
+		}
 	}
 
-	// TdsK + Offset
-	if v, ok := parameters[tdsKParam]; !ok {
-		failures[tdsKParam] = append(failures[tdsKParam], "TdsK is required.")
-	} else if _, ok := hal.ConvertToFloat(v); !ok {
-		failures[tdsKParam] = append(failures[tdsKParam], fmt.Sprintf("TdsK must be a number, got %v.", v))
-	}
-	if v, ok := parameters[tdsOffsetParam]; !ok {
-		failures[tdsOffsetParam] = append(failures[tdsOffsetParam], "TdsOffset is required.")
-	} else if _, ok := hal.ConvertToFloat(v); !ok {
-		failures[tdsOffsetParam] = append(failures[tdsOffsetParam], fmt.Sprintf("TdsOffset must be a number, got %v.", v))
+	// Vref, TdsK, TdsOffset (just validate they parse as float)
+	for _, p := range []string{vrefParam, tdsKParam, tdsOffsetParam} {
+		if v, ok := parameters[p]; ok {
+			if _, ok := hal.ConvertToFloat(v); !ok {
+				failures[p] = append(failures[p], fmt.Sprintf("%s must be a float, got: %v", p, v))
+			}
+		}
 	}
 
 	// Gains
-	for _, p := range gainParams {
-		v, ok := parameters[p]
+	for _, gname := range channelGains {
+		v, ok := parameters[gname]
 		if !ok {
-			failures[p] = append(failures[p], "Gain is required.")
+			failures[gname] = append(failures[gname], gname+" is required.")
 			continue
 		}
-		if _, err := parseGain(v); err != nil {
-			failures[p] = append(failures[p], err.Error())
+		gs, err := parseGain(v)
+		if err != nil {
+			failures[gname] = append(failures[gname], gname+err.Error())
+			continue
+		}
+		if _, ok := gainOptions[gs]; !ok {
+			failures[gname] = append(failures[gname], fmt.Sprintf("%s invalid (use 2/3,1,2,4,8,16), got: %v", gname, v))
 		}
 	}
 
@@ -130,35 +129,42 @@ func (f *ads1115TdsFactory) ValidateParameters(parameters map[string]interface{}
 }
 
 func parseGain(v interface{}) (string, error) {
-	// reef-pi sometimes passes numbers; accept that too
+	// UI often passes strings, but sometimes numbers
 	if s, ok := v.(string); ok {
-		if _, ok := gainOptions[s]; ok {
-			return s, nil
-		}
-		return "", fmt.Errorf("gain must be one of 2/3, 1, 2, 4, 8, 16 (got %v)", v)
+		return s, nil
 	}
-
-	if vi, ok := hal.ConvertToInt(v); ok {
-		s := strconv.Itoa(vi.(int))
-		if _, ok := gainOptions[s]; ok {
-			return s, nil
-		}
-		return "", fmt.Errorf("gain must be one of 2/3, 1, 2, 4, 8, 16 (got %v)", v)
+	if iv, ok := hal.ConvertToInt(v); ok {
+		return strconv.Itoa(iv.(int)), nil
 	}
-
-	return "", fmt.Errorf("gain must be a string/number (got %T)", v)
+	return "", fmt.Errorf(" must be a string or number, got: %T", v)
 }
 
-func (f *ads1115TdsFactory) New(parameters map[string]interface{}, hardwareResources interface{}) (hal.Driver, error) {
+func (f *ads1115TdsFactory) NewDriver(parameters map[string]interface{}, hardwareResources interface{}) (hal.Driver, error) {
 	if valid, failures := f.ValidateParameters(parameters); !valid {
 		return nil, errors.New(hal.ToErrorString(failures))
 	}
 
 	bus := hardwareResources.(i2c.Bus)
 
-	ai, _ := hal.ConvertToInt(parameters[addressParam])
-	address := byte(ai.(int))
+	intAddress, _ := hal.ConvertToInt(parameters[addressParam])
+	address := byte(intAddress.(int))
 
+	// Confirm device responds
+	var tmp [2]byte
+	if err := bus.ReadFromReg(address, regConfig, tmp[:]); err != nil {
+		return nil, err
+	}
+
+	// Delay
+	delayMs := 2
+	if v, ok := parameters[delayMsParam]; ok {
+		if iv, ok := hal.ConvertToInt(v); ok {
+			delayMs = iv.(int)
+		}
+	}
+	delay := time.Duration(delayMs) * time.Millisecond
+
+	// Knobs
 	vf, _ := hal.ConvertToFloat(parameters[vrefParam])
 	kf, _ := hal.ConvertToFloat(parameters[tdsKParam])
 	of, _ := hal.ConvertToFloat(parameters[tdsOffsetParam])
@@ -167,40 +173,21 @@ func (f *ads1115TdsFactory) New(parameters map[string]interface{}, hardwareResou
 	tdsK := kf.(float64)
 	tdsOffset := of.(float64)
 
-	// simple + reliable defaults:
-	// 860 SPS => ~1.16ms conversion time; 5-10ms delay is plenty even with bus jitter
-	dataRate := configDataRate860
-	delay := 8 * time.Millisecond
-
-	// shared lock so multiple channels don’t fight on the same I2C bus concurrently
-	var busMu sync.Mutex
-
-	d := &driver{
+	d := driver{
 		meta:     f.meta,
-		channels: make([]hal.AnalogInputPin, 0, 4),
+		channels: []hal.AnalogInputPin{},
 	}
 
-	for ch := 0; ch < 4; ch++ {
-		gainStr, _ := parseGain(parameters[gainParams[ch]])
-		gain := gainOptions[gainStr]
+	for i, mux := range channelMux {
+		gainStr, _ := parseGain(parameters[channelGains[i]])
+		gainCfg := gainOptions[gainStr]
 
-		// Try a lightweight read of config register once (per driver creation)
-		// so a bad address fails fast. Do it once, before making channels.
-		if ch == 0 {
-			var tmp [2]byte
-			if err := bus.ReadFromReg(address, regConfig, tmp[:]); err != nil {
-				return nil, err
-			}
-		}
-
-		pin, err := newTdsChannel(
+		ch, err := newTdsChannel(
 			bus,
-			&busMu,
 			address,
-			ch,
-			channelMux[ch],
-			gain,
-			dataRate,
+			i,
+			mux,
+			gainCfg,
 			delay,
 			vref,
 			tdsK,
@@ -209,8 +196,8 @@ func (f *ads1115TdsFactory) New(parameters map[string]interface{}, hardwareResou
 		if err != nil {
 			return nil, err
 		}
-		d.channels = append(d.channels, pin)
+		d.channels = append(d.channels, ch)
 	}
 
-	return d, nil
+	return &d, nil
 }
