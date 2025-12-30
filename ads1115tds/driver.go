@@ -4,56 +4,25 @@ import (
 	"fmt"
 
 	"github.com/reef-pi/hal"
-	"github.com/reef-pi/rpi/i2c"
 )
 
 type Driver struct {
-	bus      i2c.Bus
-	address  byte
-	channels []*tdsChannel
+	channels []hal.AnalogInputPin
+	meta     hal.Metadata
 }
 
-func (d *Driver) Metadata() hal.Metadata {
-	return hal.Metadata{
-		Name:        "ads1115-tds",
-		Description: "ADS1115 analog TDS driver (single channel, linear volts->tds)",
-		Capabilities: []hal.Capability{
-			hal.AnalogInput,
-		},
-	}
-}
+func (d *Driver) Metadata() hal.Metadata { return d.meta }
 
-func (d *Driver) Close() error {
-	if d.bus != nil {
-		return d.bus.Close()
-	}
-	return nil
-}
+func (d *Driver) AnalogInputPins() []hal.AnalogInputPin { return d.channels }
 
-func (d *Driver) Pins(cap hal.Capability) ([]hal.Pin, error) {
-	if cap != hal.AnalogInput {
-		return []hal.Pin{}, nil
-	}
-	out := make([]hal.Pin, 0, len(d.channels))
+// IMPORTANT: match by pin Number() (so if your pin is channel 2, you request 2)
+func (d *Driver) AnalogInputPin(n int) (hal.AnalogInputPin, error) {
 	for _, ch := range d.channels {
-		out = append(out, ch)
-	}
-	return out, nil
-}
-
-func (d *Driver) AnalogInputPins() []hal.AnalogInputPin {
-	out := make([]hal.AnalogInputPin, 0, len(d.channels))
-	for _, ch := range d.channels {
-		out = append(out, ch)
-	}
-	return out
-}
-
-func (d *Driver) AnalogInputPin(pin int) (hal.AnalogInputPin, error) {
-	for _, ch := range d.channels {
-		if ch.Number() == pin {
+		if ch.Number() == n {
 			return ch, nil
 		}
 	}
-	return nil, fmt.Errorf("ads1115-tds: analog pin not found: %d", pin)
+	return nil, fmt.Errorf("ads1115-tds: no analog input channel %d", n)
 }
+
+func (d *Driver) Close() error { return nil }

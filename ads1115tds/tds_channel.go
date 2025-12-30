@@ -89,7 +89,7 @@ func (c *tdsChannel) performConversion() (int16, error) {
 		configComparitorQueueNone |
 		c.mux |
 		c.gainConfig |
-		configDataRate860) // ADS1115 max SPS
+		configDataRate860)
 
 	buf := make([]byte, 2)
 	binary.BigEndian.PutUint16(buf, config)

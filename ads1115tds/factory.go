@@ -10,14 +10,13 @@ import (
 )
 
 const (
-	paramBus      = "Bus"      // i2c bus number (usually 1)
-	paramAddress  = "Address"  // i2c address (decimal, e.g. 72) or hex string (e.g. "0x48")
-	paramChannel  = "Channel"  // 0..3 for A0..A3
-	paramGain     = "Gain"     // "2/3","1","2","4","8","16" OR numeric 0..5 (advanced)
-	paramDelayMs  = "DelayMs"  // conversion wait in ms
-	paramVref     = "Vref"     // optional clamp
-	paramTdsK     = "TdsK"     // linear slope
-	paramTdsOff   = "TdsOffset"
+	paramAddress = "Address"  // i2c address (decimal int or hex string like "0x48")
+	paramChannel = "Channel"  // 0..3 for A0..A3
+	paramGain    = "Gain"     // "2/3","1","2","4","8","16"
+	paramDelayMs = "DelayMs"  // conversion wait ms
+	paramVref    = "Vref"     // optional clamp
+	paramTdsK    = "TdsK"     // slope
+	paramTdsOff  = "TdsOffset"
 )
 
 type factory struct{}
@@ -36,26 +35,18 @@ func (f *factory) Metadata() hal.Metadata {
 
 func (f *factory) GetParameters() []hal.ConfigParameter {
 	return []hal.ConfigParameter{
-		{Name: paramBus, Type: hal.Integer, Order: 0, Default: 1},
-		{Name: paramAddress, Type: hal.String, Order: 1, Default: "0x48"},
-		{Name: paramChannel, Type: hal.Integer, Order: 2, Default: 0},
-		{Name: paramGain, Type: hal.String, Order: 3, Default: "1"}, // +/-4.096
-		{Name: paramDelayMs, Type: hal.Integer, Order: 4, Default: 10},
-		{Name: paramVref, Type: hal.Decimal, Order: 5, Default: 3.3},
-		{Name: paramTdsK, Type: hal.Decimal, Order: 6, Default: 1.0},
-		{Name: paramTdsOff, Type: hal.Decimal, Order: 7, Default: 0.0},
+		{Name: paramAddress, Type: hal.String, Order: 0, Default: "0x48"},
+		{Name: paramChannel, Type: hal.Integer, Order: 1, Default: 0},
+		{Name: paramGain, Type: hal.String, Order: 2, Default: "1"}, // +/-4.096
+		{Name: paramDelayMs, Type: hal.Integer, Order: 3, Default: 10},
+		{Name: paramVref, Type: hal.Decimal, Order: 4, Default: 3.3},
+		{Name: paramTdsK, Type: hal.Decimal, Order: 5, Default: 1.0},
+		{Name: paramTdsOff, Type: hal.Decimal, Order: 6, Default: 0.0},
 	}
 }
 
 func (f *factory) ValidateParameters(p map[string]interface{}) (bool, map[string][]string) {
 	fail := map[string][]string{}
-
-	// bus
-	if v, ok := p[paramBus]; ok {
-		if i, ok2 := hal.ConvertToInt(v); !ok2 || i <= 0 {
-			fail[paramBus] = append(fail[paramBus], "must be a positive integer")
-		}
-	}
 
 	// address
 	if v, ok := p[paramAddress]; ok {
@@ -99,42 +90,39 @@ func (f *factory) ValidateParameters(p map[string]interface{}) (bool, map[string
 	return len(fail) == 0, fail
 }
 
-func (f *factory) NewDriver(parameters map[string]interface{}, _ interface{}) (hal.Driver, error) {
+// hardwareResources is expected to be an i2c.Bus injected by reef-pi.
+func (f *factory) NewDriver(parameters map[string]interface{}, hardwareResources interface{}) (hal.Driver, error) {
 	ok, failures := f.ValidateParameters(parameters)
 	if !ok {
 		return nil, fmt.Errorf("invalid parameters: %s", hal.ToErrorString(failures))
 	}
 
-	// bus
-	busNum := 1
-	if v, ok := parameters[paramBus]; ok {
-		if i, ok2 := hal.ConvertToInt(v); ok2 {
-			busNum = i
-		}
+	bus, ok := hardwareResources.(i2c.Bus)
+	if !ok {
+		return nil, fmt.Errorf("ads1115-tds: expected i2c.Bus as hardware resource, got %T", hardwareResources)
 	}
 
-	// address
 	addr, err := parseI2CAddress(parameters[paramAddress])
 	if err != nil {
 		return nil, err
 	}
 
-	// channel -> mux
 	ch := 0
 	if v, ok := parameters[paramChannel]; ok {
 		if i, ok2 := hal.ConvertToInt(v); ok2 {
 			ch = i
 		}
 	}
-	mux, _ := muxForChannel(ch)
+	mux, okMux := muxForChannel(ch)
+	if !okMux {
+		return nil, fmt.Errorf("ads1115-tds: invalid channel %d (must be 0..3)", ch)
+	}
 
-	// gain
 	gain, err := parseGain(parameters[paramGain])
 	if err != nil {
 		return nil, err
 	}
 
-	// delay
 	delayMs := 10
 	if v, ok := parameters[paramDelayMs]; ok {
 		if i, ok2 := hal.ConvertToInt(v); ok2 {
@@ -143,25 +131,16 @@ func (f *factory) NewDriver(parameters map[string]interface{}, _ interface{}) (h
 	}
 	delay := time.Duration(delayMs) * time.Millisecond
 
-	// floats
 	vref, _ := convertToFloat(parameters[paramVref])
 	tdsK, _ := convertToFloat(parameters[paramTdsK])
 	tdsOff, _ := convertToFloat(parameters[paramTdsOff])
 
-	// Open i2c bus
-	bus, err := i2c.New(busNum)
-	if err != nil {
-		return nil, err
-	}
+	pin := newTdsChannel(bus, addr, ch, mux, gain, delay, vref, tdsK, tdsOff)
 
-	d := &Driver{
-		bus:     bus,
-		address: addr,
-		channels: []*tdsChannel{
-			newTdsChannel(bus, addr, ch, mux, gain, delay, vref, tdsK, tdsOff),
-		},
-	}
-	return d, nil
+	return &Driver{
+		meta:     f.Metadata(),
+		channels: []hal.AnalogInputPin{pin},
+	}, nil
 }
 
 func parseI2CAddress(v interface{}) (byte, error) {
@@ -192,10 +171,10 @@ func parseI2CAddress(v interface{}) (byte, error) {
 }
 
 func parseGain(v interface{}) (uint16, error) {
-	// Accept a friendly string: "2/3","1","2","4","8","16"
+	// Friendly strings
 	if s, ok := v.(string); ok {
 		switch s {
-		case "2/3", "0", "0.666", "0.67":
+		case "2/3":
 			return configGainTwoThirds, nil
 		case "1":
 			return configGainOne, nil
@@ -208,7 +187,7 @@ func parseGain(v interface{}) (uint16, error) {
 		case "16":
 			return configGainSixteen, nil
 		default:
-			// allow "0..5" as string
+			// allow "0..5" as string too
 			if n, err := strconv.Atoi(s); err == nil {
 				return parseGain(n)
 			}
@@ -216,7 +195,7 @@ func parseGain(v interface{}) (uint16, error) {
 		}
 	}
 
-	// Or accept an int (advanced): 0..5 mapping
+	// Advanced: int mapping 0..5
 	if n, ok := hal.ConvertToInt(v); ok {
 		switch n {
 		case 0:
@@ -249,25 +228,12 @@ func convertToFloat(v interface{}) (float64, error) {
 		return float64(t), nil
 	case int64:
 		return float64(t), nil
-	case jsonNumber:
-		return t.Float64()
 	case string:
-		f, err := strconv.ParseFloat(t, 64)
-		if err != nil {
-			return 0, err
-		}
-		return f, nil
+		return strconv.ParseFloat(t, 64)
 	default:
-		// some JSON libs may use int via interface{}, hal doesn't provide ConvertToFloat
 		if i, ok := hal.ConvertToInt(v); ok {
 			return float64(i), nil
 		}
 		return 0, fmt.Errorf("not a number")
 	}
-}
-
-// tiny shim so we don't hard-depend on encoding/json here;
-// if the value happens to be json.Number, it will satisfy this.
-type jsonNumber interface {
-	Float64() (float64, error)
 }
