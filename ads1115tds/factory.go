@@ -3,7 +3,6 @@ package ads1115tds
 import (
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/reef-pi/hal"
 	"github.com/reef-pi/rpi/i2c"
@@ -13,8 +12,6 @@ const (
 	paramAddress = "Address"  // i2c address (decimal int or hex string like "0x48")
 	paramChannel = "Channel"  // 0..3 for A0..A3
 	paramGain    = "Gain"     // "2/3","1","2","4","8","16"
-	paramDelayMs = "DelayMs"  // conversion wait ms
-	paramVref    = "Vref"     // optional clamp
 	paramTdsK    = "TdsK"     // slope
 	paramTdsOff  = "TdsOffset"
 )
@@ -38,10 +35,8 @@ func (f *factory) GetParameters() []hal.ConfigParameter {
 		{Name: paramAddress, Type: hal.String, Order: 0, Default: "0x48"},
 		{Name: paramChannel, Type: hal.Integer, Order: 1, Default: 0},
 		{Name: paramGain, Type: hal.String, Order: 2, Default: "1"}, // +/-4.096
-		{Name: paramDelayMs, Type: hal.Integer, Order: 3, Default: 10},
-		{Name: paramVref, Type: hal.Decimal, Order: 4, Default: 3.3},
-		{Name: paramTdsK, Type: hal.Decimal, Order: 5, Default: 1.0},
-		{Name: paramTdsOff, Type: hal.Decimal, Order: 6, Default: 0.0},
+		{Name: paramTdsK, Type: hal.Decimal, Order: 3, Default: 1.0},
+		{Name: paramTdsOff, Type: hal.Decimal, Order: 4, Default: 0.0},
 	}
 }
 
@@ -70,16 +65,8 @@ func (f *factory) ValidateParameters(p map[string]interface{}) (bool, map[string
 		}
 	}
 
-	// delay
-	if v, ok := p[paramDelayMs]; ok {
-		i, ok2 := hal.ConvertToInt(v)
-		if !ok2 || i < 0 {
-			fail[paramDelayMs] = append(fail[paramDelayMs], "must be >= 0")
-		}
-	}
-
 	// decimals
-	for _, k := range []string{paramVref, paramTdsK, paramTdsOff} {
+	for _, k := range []string{paramTdsK, paramTdsOff} {
 		if v, ok := p[k]; ok {
 			if _, err := convertToFloat(v); err != nil {
 				fail[k] = append(fail[k], "must be a decimal number")
@@ -123,19 +110,11 @@ func (f *factory) NewDriver(parameters map[string]interface{}, hardwareResources
 		return nil, err
 	}
 
-	delayMs := 10
-	if v, ok := parameters[paramDelayMs]; ok {
-		if i, ok2 := hal.ConvertToInt(v); ok2 {
-			delayMs = i
-		}
-	}
-	delay := time.Duration(delayMs) * time.Millisecond
-
-	vref, _ := convertToFloat(parameters[paramVref])
 	tdsK, _ := convertToFloat(parameters[paramTdsK])
 	tdsOff, _ := convertToFloat(parameters[paramTdsOff])
 
-	pin := newTdsChannel(bus, addr, ch, mux, gain, delay, vref, tdsK, tdsOff)
+	// NOTE: delay + vref are now fixed inside tds_channel.go
+	pin := newTdsChannel(bus, addr, ch, mux, gain, tdsK, tdsOff)
 
 	return &Driver{
 		meta:     f.Metadata(),

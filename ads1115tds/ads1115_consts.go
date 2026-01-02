@@ -58,21 +58,22 @@ func muxForChannel(ch int) (uint16, bool) {
 	}
 }
 
-func fsVoltsForGain(g uint16) (float64, bool) {
-	switch g {
-	case configGainTwoThirds:
+func fsVoltsForGain(gain uint16) (float64, bool) {
+	switch gain {
+	case 0x0000:
 		return 6.144, true
-	case configGainOne:
+	case 0x0200:
 		return 4.096, true
-	case configGainTwo:
+	case 0x0400:
 		return 2.048, true
-	case configGainFour:
+	case 0x0600:
 		return 1.024, true
-	case configGainEight:
+	case 0x0800:
 		return 0.512, true
-	case configGainSixteen:
+	case 0x0A00:
 		return 0.256, true
 	default:
 		return 0, false
 	}
 }
+

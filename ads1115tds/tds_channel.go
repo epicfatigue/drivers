@@ -3,6 +3,7 @@ package ads1115tds
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/reef-pi/hal"
@@ -10,6 +11,16 @@ import (
 )
 
 var debugADS1115TDS = true
+var logBusTypeOnce sync.Once
+
+const (
+	// fixed clamp for any computed voltage
+	fixedVref = 3.3
+
+	// conversion poll limits (ADS1115 @ 860SPS is ~1.2ms)
+	convTimeout  = 50 * time.Millisecond
+	convPollWait = 200 * time.Microsecond
+)
 
 type tdsChannel struct {
 	bus     i2c.Bus
@@ -18,9 +29,7 @@ type tdsChannel struct {
 
 	mux        uint16
 	gainConfig uint16
-	delay      time.Duration
 
-	vref      float64
 	tdsK      float64
 	tdsOffset float64
 }
@@ -31,8 +40,6 @@ func newTdsChannel(
 	channelNum int,
 	mux uint16,
 	gain uint16,
-	delay time.Duration,
-	vref float64,
 	tdsK float64,
 	tdsOffset float64,
 ) *tdsChannel {
@@ -42,8 +49,6 @@ func newTdsChannel(
 		channel:    channelNum,
 		mux:        mux,
 		gainConfig: gain,
-		delay:      delay,
-		vref:       vref,
 		tdsK:       tdsK,
 		tdsOffset:  tdsOffset,
 	}
@@ -56,9 +61,9 @@ func (c *tdsChannel) dbg(format string, args ...any) {
 	log.Printf("ads1115tds addr=0x%02X ch=%d: %s", c.address, c.channel, fmt.Sprintf(format, args...))
 }
 
-func (c *tdsChannel) Name() string { return fmt.Sprintf("%d", c.channel) }
-func (c *tdsChannel) Number() int  { return c.channel }
-func (c *tdsChannel) Close() error { return nil }
+func (c *tdsChannel) Name() string                             { return fmt.Sprintf("%d", c.channel) }
+func (c *tdsChannel) Number() int                              { return c.channel }
+func (c *tdsChannel) Close() error                             { return nil }
 func (c *tdsChannel) Calibrate(points []hal.Measurement) error { return nil }
 
 func (c *tdsChannel) Value() (float64, error) {
@@ -84,7 +89,10 @@ func (c *tdsChannel) Measure() (float64, error) {
 }
 
 func (c *tdsChannel) performConversion() (int16, error) {
-	// single-shot config
+	logBusTypeOnce.Do(func() {
+		c.dbg("INJECTED I2C BUS TYPE = %T", c.bus)
+	})
+
 	config := uint16(
 		configOsSingle |
 			configModeSingle |
@@ -99,17 +107,33 @@ func (c *tdsChannel) performConversion() (int16, error) {
 
 	c.dbg("write cfg=0x%04X mux=0x%04X gain=0x%04X", config, c.mux, c.gainConfig)
 
+	// write config (starts conversion)
 	buf := []byte{byte(config >> 8), byte(config)}
 	if err := c.bus.WriteToReg(c.address, regConfig, buf); err != nil {
 		return 0, fmt.Errorf("ads1115: write config: %w", err)
 	}
 
-	// Give conversion time. 860 SPS is ~1.2ms, but add margin.
-	time.Sleep(10 * time.Millisecond)
-	if c.delay > 0 {
-		time.Sleep(c.delay)
+	// reuse buffer instead of allocating each loop
+	cfg := make([]byte, 2)
+
+	// wait for conversion complete by polling OS bit
+	deadline := time.Now().Add(convTimeout)
+	for {
+		if err := c.bus.ReadFromReg(c.address, regConfig, cfg); err != nil {
+			return 0, fmt.Errorf("ads1115: read config: %w", err)
+		}
+		cfgVal := uint16(cfg[0])<<8 | uint16(cfg[1])
+
+		if cfgVal&configOsSingle != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("ads1115: conversion timeout (last cfg=0x%04X)", cfgVal)
+		}
+		time.Sleep(convPollWait)
 	}
 
+	// read conversion register
 	b := make([]byte, 2)
 	if err := c.bus.ReadFromReg(c.address, regConversion, b); err != nil {
 		return 0, fmt.Errorf("ads1115: read conversion: %w", err)
@@ -122,26 +146,6 @@ func (c *tdsChannel) performConversion() (int16, error) {
 	return raw, nil
 }
 
-// Correct ADS1115 gain->FSR mapping
-func fsVoltsForGain(gain uint16) (float64, bool) {
-	switch gain {
-	case 0x0000:
-		return 6.144, true
-	case 0x0200:
-		return 4.096, true
-	case 0x0400:
-		return 2.048, true
-	case 0x0600:
-		return 1.024, true
-	case 0x0800:
-		return 0.512, true
-	case 0x0A00:
-		return 0.256, true
-	default:
-		return 0, false
-	}
-}
-
 func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
 	fs, ok := fsVoltsForGain(c.gainConfig)
 	if !ok {
@@ -150,8 +154,12 @@ func (c *tdsChannel) rawToVolts(raw int16) (float64, error) {
 
 	volts := (float64(raw) / 32768.0) * fs
 
-	if c.vref > 0 && volts > c.vref {
-		volts = c.vref
+	// fixed clamp at 3.3V (and no negatives for single-ended)
+	if volts > fixedVref {
+		volts = fixedVref
+	}
+	if volts < 0 {
+		volts = 0
 	}
 	return volts, nil
 }
