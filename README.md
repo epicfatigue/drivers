@@ -16,6 +16,7 @@ in [reef-pi](http://reef-pi.com) project. They are intended to have
 minimal dependencies (most cases only reef-pi/rpi). These drivers API
 are not stable, and subjected to change as per reef-pi's requirement.
 
+
 ## Currently available drivers
 
 - Kasa hs300, hs303, hs103, hs110 smart switches and power strips
