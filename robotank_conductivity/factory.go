@@ -1,3 +1,4 @@
+// factory.go
 package robotank_conductivity
 
 import (
