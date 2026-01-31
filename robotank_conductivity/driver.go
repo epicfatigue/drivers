@@ -1,3 +1,4 @@
+// driver.go
 package robotank_conductivity
 
 import (
@@ -6,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/reef-pi/hal"
@@ -29,6 +31,13 @@ type RoboTankConductivity struct {
 	delay time.Duration
 	meta  hal.Metadata
 
+	// Serialize *all* I2C command/response sequences.
+	// This prevents interleaving between:
+	// - channel 0 reads and channel 1 reads
+	// - snapshot() and read()
+	// - multiple API calls arriving concurrently
+	mu sync.Mutex
+
 	// Calibration + conversion settings (loaded from factory parameters)
 	absDFresh float64 // abs(U-V) in fresh/RODI (maps -> 0 uS)
 	absDStd   float64 // abs(U-V) in conductivity standard (maps -> RefUS)
@@ -47,7 +56,7 @@ type RoboTankConductivity struct {
 
 	debug bool
 
-	// two pins
+	// two pins (channels 0 and 1)
 	pins []*rtPin
 }
 
@@ -65,8 +74,19 @@ func (p *rtPin) SetTemperatureC(tempC float64) {
 
 // ---------------- I2C helpers ----------------
 
+// drain tries to clear any stale buffered response on the device.
+// Many "EZO-like" firmwares will keep previous output until overwritten.
+// We intentionally ignore errors.
+func (d *RoboTankConductivity) drain() {
+	_, _ = d.bus.ReadBytes(d.addr, 32)
+}
+
 func (d *RoboTankConductivity) command(cmd string) error {
-	// NUL terminator helps EZO-style parsing; harmless for your Arduino firmware
+	// Clear any previous response before we send a new command.
+	// This helps prevent "stale response reuse".
+	d.drain()
+
+	// NUL terminator helps EZO-style parsing; harmless for most Arduino firmwares
 	if err := d.bus.WriteBytes(d.addr, []byte(cmd+"\x00")); err != nil {
 		return err
 	}
@@ -77,6 +97,8 @@ func (d *RoboTankConductivity) command(cmd string) error {
 // read returns EZO-style response:
 // payload[0]=status (1=OK), payload[1:]=ASCII text (NUL padded)
 // Some devices also include trailing 0xFF filler; strip it.
+//
+// the debug logs will show you the raw payload in hex so we can adapt parsing.
 func (d *RoboTankConductivity) read() (string, error) {
 	payload, err := d.bus.ReadBytes(d.addr, 32)
 	if err != nil {
@@ -85,6 +107,12 @@ func (d *RoboTankConductivity) read() (string, error) {
 	if len(payload) == 0 {
 		return "", fmt.Errorf("empty i2c payload")
 	}
+
+	if d.debug {
+		log.Printf("robotank_cond addr=%d raw payload: % X", d.addr, payload)
+	}
+
+	// Status byte expectation (EZO-like)
 	if payload[0] != 1 {
 		return "", fmt.Errorf("device status=%d payload=%v", payload[0], payload)
 	}
@@ -107,19 +135,66 @@ func (d *RoboTankConductivity) read() (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// parseFirstFloat extracts the first parseable float out of a response string.
+// This tolerates formats like:
+// "14.322"
+// "U=14.322"
+// "14.322,OK"
+// "U,14.322"
+func parseFirstFloat(resp string) (float64, error) {
+	// Split on common separators; keep numeric tokens
+	fields := strings.FieldsFunc(resp, func(r rune) bool {
+		switch r {
+		case ',', ' ', '\t', '\r', '\n', '=':
+			return true
+		default:
+			return false
+		}
+	})
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		// tolerate comma decimal
+		f = strings.ReplaceAll(f, ",", ".")
+		if v, err := strconv.ParseFloat(f, 64); err == nil {
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("no float found in resp=%q", resp)
+}
+
+// readFloat sends a command then reads/parses a float response.
+// Includes retry logic for timing jitter or transient stale reads.
 func (d *RoboTankConductivity) readFloat(cmd string) (float64, error) {
 	if err := d.command(cmd); err != nil {
 		return 0, err
 	}
-	resp, err := d.read()
-	if err != nil {
-		return 0, err
+
+	var lastErr error
+	for i := 0; i < 6; i++ {
+		resp, err := d.read()
+		if err != nil {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if d.debug {
+			log.Printf("robotank_cond addr=%d cmd=%q resp=%q", d.addr, cmd, resp)
+		}
+
+		v, err := parseFirstFloat(resp)
+		if err == nil {
+			return v, nil
+		}
+
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
 	}
-	v, err := strconv.ParseFloat(resp, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse float cmd=%q resp=%q: %w", cmd, resp, err)
-	}
-	return v, nil
+
+	return 0, fmt.Errorf("cmd=%q: %v", cmd, lastErr)
 }
 
 // ---------------- Board API ----------------
@@ -128,6 +203,9 @@ func (d *RoboTankConductivity) TestHigh() (float64, error) { return d.readFloat(
 func (d *RoboTankConductivity) TestLow() (float64, error)  { return d.readFloat("V") }
 
 func (d *RoboTankConductivity) Firmware() (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	if err := d.command("H"); err != nil {
 		return "", err
 	}
@@ -135,6 +213,9 @@ func (d *RoboTankConductivity) Firmware() (string, error) {
 }
 
 func (d *RoboTankConductivity) SetWaterType(wt int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	return d.command(fmt.Sprintf("W,%d", wt))
 }
 
@@ -153,8 +234,14 @@ func (d *RoboTankConductivity) SetTemperatureC(tempC float64) {
 
 // ---------------- Math / conversion ----------------
 
-// absDiff reads U and V and returns |U-V|
+// absDiff reads U and V and returns |U-V|.
+//
+// CRITICAL: this locks across BOTH command/reads so that multiple callers
+// cannot interleave the protocol and accidentally swap or duplicate responses.
 func (d *RoboTankConductivity) absDiff() (ad, u, v float64, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	u, err = d.TestHigh()
 	if err != nil {
 		return 0, 0, 0, err
@@ -390,10 +477,10 @@ func (p *rtPin) Snapshot() (hal.Snapshot, error) {
 			}
 			return "Salinity (ppt)"
 		}(),
-		"abs_d": "|U−V| (mV)",
-		"U":     "U (mV)",
-		"V":     "V (mV)",
-		"tempC": "Temperature (°C)",
+		"abs_d":  "|U−V| (mV)",
+		"U":      "U (mV)",
+		"V":      "V (mV)",
+		"tempC":  "Temperature (°C)",
 		"us_ref": "Conductivity (uS/cm @ ref temp)",
 		"ppt":    "Salinity (ppt)",
 	}
