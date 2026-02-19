@@ -19,18 +19,16 @@ type factory struct {
 	parameters []hal.ConfigParameter
 }
 
-// Canonical parameter names (what YOUR code uses)
-// Note: we keep AbsD_53000 as the UI name for backwards compatibility,
-// but the driver treats it as "AbsD_Std" (standard point) and RefUS is FIXED at 53000.
 const (
-	addressParam    = "Address"
-	absDFreshParam  = "AbsD_Fresh"
-	absDStdParamUI  = "AbsD_53000" // kept for compatibility with existing configs/UI
-	refTempCParam   = "RefTempC"
-	doTempCompParam = "DoTempComp"
-	debugParam      = "Debug"
-	delayMsParam    = "DelayMs" // optional if your fork sends it
+	addressParam   = "Address"
+	absDRODIParam  = "AbsD_RODI"
+	absDStdParam   = "AbsD_Std"
+	alphaPerCParam = "AlphaPerC"
+	debugParam     = "Debug"
 )
+
+// fixed, non-configurable read delay
+const fixedDelayMs = 200
 
 var f *factory
 var once sync.Once
@@ -39,23 +37,48 @@ func Factory() hal.DriverFactory {
 	once.Do(func() {
 		f = &factory{
 			meta: hal.Metadata{
-				Name:         driverName,
-				Description:  "Robo-Tank conductivity circuit (µS/cm + ppt)",
-				Capabilities: []hal.Capability{hal.AnalogInput},
+				Name:        driverName,
+				Description: "Robo-Tank conductivity circuit (µS/cm + ppt). Assumes 25°C reference and 53,000 µS/cm standard calibration solution.",
+				Capabilities: []hal.Capability{
+					hal.AnalogInput,
+				},
 			},
-			// This parameter list is what reef-pi UI renders for NEW configs.
-			// We intentionally DO NOT expose RefUS / AlphaPerC / TempC (fixed / injected).
 			parameters: []hal.ConfigParameter{
-				{Name: addressParam, Type: hal.Integer, Order: 0, Default: 106},
-
-				{Name: absDFreshParam, Type: hal.Decimal, Order: 1, Default: 983},
-				{Name: absDStdParamUI, Type: hal.Decimal, Order: 2, Default: 21},
-
-				{Name: refTempCParam, Type: hal.Decimal, Order: 3, Default: 25.0},
-				{Name: doTempCompParam, Type: hal.Boolean, Order: 4, Default: false},
-
-				{Name: delayMsParam, Type: hal.Integer, Order: 5, Default: 200},
-				{Name: debugParam, Type: hal.Boolean, Order: 6, Default: false},
+				{
+					Name:        addressParam,
+					Type:        hal.Integer,
+					Order:       0,
+					Default:     106,
+					Description: "I²C 7-bit address of the Robo-Tank conductivity board.",
+				},
+				{
+					Name:        absDRODIParam,
+					Type:        hal.Decimal,
+					Order:       1,
+					Default:     1010,
+					Description: "Absolute |U−V| reading (mV) measured in RO/DI water.",
+				},
+				{
+					Name:        absDStdParam,
+					Type:        hal.Decimal,
+					Order:       2,
+					Default:     24.328,
+					Description: "Absolute |U−V| reading (mV) measured in 53,000 µS/cm calibration solution at 25°C.",
+				},
+				{
+					Name:        alphaPerCParam,
+					Type:        hal.Decimal,
+					Order:       3,
+					Default:     fixedAlphaPerC,
+					Description: "Temperature coefficient (per °C) used for compensation to 25°C.",
+				},
+				{
+					Name:        debugParam,
+					Type:        hal.Boolean,
+					Order:       4,
+					Default:     false,
+					Description: "Enable verbose logging of raw readings, temperature compensation, and scaling calculations.",
+				},
 			},
 		}
 	})
@@ -68,121 +91,130 @@ func (f *factory) GetParameters() []hal.ConfigParameter {
 }
 
 func (f *factory) ValidateParameters(parameters map[string]interface{}) (bool, map[string][]string) {
-	failures := make(map[string][]string)
+  failures := make(map[string][]string)
 
-	// Address required (support aliases too)
-	address, ok := getAny(parameters, addressParam, "address")
-	if !ok {
-		failures[addressParam] = append(failures[addressParam], "Address parameter is required")
-		return false, failures
-	}
+  address, ok := getAny(parameters, addressParam)
+  if !ok {
+    failures[addressParam] = append(failures[addressParam], "Address parameter is required")
+    return false, failures
+  }
 
-	val, ok := toInt(address)
-	if !ok {
-		failures[addressParam] = append(failures[addressParam], "Address must be an integer")
-	} else if val < 0 || val > 127 {
-		failures[addressParam] = append(failures[addressParam], "Address must be 0..127 (7-bit)")
-	}
+  val, ok := toInt(address)
+  if !ok {
+    failures[addressParam] = append(failures[addressParam], "Address must be an integer")
+  } else if val < 0 || val > 127 {
+    failures[addressParam] = append(failures[addressParam], "Address must be 0..127 (7-bit)")
+  }
 
-	return len(failures) == 0, failures
+  absRODI := getFloatAny(parameters, f.defaultFloatParam(absDRODIParam, 0), absDRODIParam)
+  absSTD  := getFloatAny(parameters, f.defaultFloatParam(absDStdParam, 0),  absDStdParam)
+
+  if absRODI <= 0 {
+    failures[absDRODIParam] = append(failures[absDRODIParam], "AbsD_RODI must be > 0")
+  }
+  if absSTD <= 0 {
+    failures[absDStdParam] = append(failures[absDStdParam], "AbsD_Std must be > 0")
+  }
+  if absRODI > 0 && absSTD > 0 && absRODI == absSTD {
+    failures[absDStdParam] = append(failures[absDStdParam], "AbsD_RODI and AbsD_Std must be different")
+  }
+
+  alpha := getFloatAny(parameters, f.defaultFloatParam(alphaPerCParam, fixedAlphaPerC), alphaPerCParam)
+  if alpha < 0 {
+    failures[alphaPerCParam] = append(failures[alphaPerCParam], "AlphaPerC must be >= 0")
+  } else if alpha > 0.05 {
+    failures[alphaPerCParam] = append(failures[alphaPerCParam], "AlphaPerC is unusually high (expected ~0.0 to 0.05 per °C)")
+  }
+
+  return len(failures) == 0, failures
 }
+
 
 func (f *factory) NewDriver(parameters map[string]interface{}, hardwareResources interface{}) (hal.Driver, error) {
-	if valid, failures := f.ValidateParameters(parameters); !valid {
-		return nil, errors.New(hal.ToErrorString(failures))
-	}
+  if valid, failures := f.ValidateParameters(parameters); !valid {
+    return nil, errors.New(hal.ToErrorString(failures))
+  }
 
-	// Debug: shows the EXACT keys your fork is passing.
-	if b, err := json.MarshalIndent(parameters, "", "  "); err == nil {
-		log.Printf("robotank_cond NewDriver raw parameters:\n%s", string(b))
-	}
+  if b, err := json.MarshalIndent(parameters, "", "  "); err == nil {
+    log.Printf("robotank_cond NewDriver parameters:\n%s", string(b))
+  }
 
-	addrRaw, _ := getAny(parameters, addressParam, "address")
-	addrInt, _ := toInt(addrRaw)
+  bus, ok := hardwareResources.(i2c.Bus)
+  if !ok {
+    return nil, errors.New("robotank_cond: expected i2c.Bus hardware resource")
+  }
 
-	absFresh := getFloatAny(parameters, 0,
-		absDFreshParam, // "AbsD_Fresh"
-		"Absd_fresh",   // your fork
-		"Absd_Fresh",
-		"absd_fresh",
-	)
+  addrRaw, _ := getAny(parameters, addressParam)
+  addrInt, _ := toInt(addrRaw)
 
-	// UI name is AbsD_53000, but we treat it as AbsD_Std (standard point @ fixedRefUS)
-	absStd := getFloatAny(parameters, 0,
-		absDStdParamUI, // "AbsD_53000"
-		"Absd_53000",   // your fork
-		"absd_53000",
-		"AbsD_Std",
-		"Absd_std",
-		"absd_std",
-	)
+  absRODI := getFloatAny(parameters, f.defaultFloatParam(absDRODIParam, 0), absDRODIParam)
+  absSTD  := getFloatAny(parameters, f.defaultFloatParam(absDStdParam, 0),  absDStdParam)
 
-	refTempC := getFloatAny(parameters, 25.0,
-		refTempCParam, // "RefTempC"
-		"Reftempc",    // your fork
-		"reftempc",
-	)
+  alphaPerC := getFloatAny(parameters, f.defaultFloatParam(alphaPerCParam, fixedAlphaPerC), alphaPerCParam)
 
-	doTempComp := getBoolAny(parameters, false,
-		doTempCompParam, // "DoTempComp"
-		"Dotempcomp",
-		"DoTC",
-		"Dotc",
-	)
+  debug := getBoolAny(parameters, f.defaultBoolParam(debugParam, false), debugParam)
 
-	debug := getBoolAny(parameters, false,
-		debugParam,
-		"debug",
-	)
 
-	delayMs := getIntAny(parameters, 200,
-		delayMsParam, // "DelayMs"
-		"Delayms",    // your fork
-		"delayms",
-	)
+  refUS := fixedRefUS
+  refTempC := fixedRefTempC
 
-	// Fixed constants (NOT configurable)
-	refUS := fixedRefUS
-	alphaPerC := fixedAlphaPerC
+  d := &RoboTankConductivity{
+    addr:      byte(addrInt),
+    bus:       bus,
+    delay:     time.Duration(fixedDelayMs) * time.Millisecond,
+    absDFresh: absRODI,
+    absDStd:   absSTD,
 
-	// Initialize tempC to refTempC until reef-pi injects a real value
-	tempC := refTempC
+    refUS:     refUS,
+    refTempC:  refTempC,
+    alphaPerC: alphaPerC,
 
-	d := &RoboTankConductivity{
-		addr:       byte(addrInt),
-		bus:        hardwareResources.(i2c.Bus),
-		delay:      time.Duration(delayMs) * time.Millisecond,
-		absDFresh:  absFresh,
-		absDStd:    absStd,
-		refUS:      refUS,
-		refTempC:   refTempC,
-		alphaPerC:  alphaPerC,
-		tempC:      tempC,
-		doTempComp: doTempComp,
-		debug:      debug,
-		meta: hal.Metadata{
-			Name:         driverName,
-			Description:  "Robo-Tank conductivity circuit (µS/cm + ppt)",
-			Capabilities: []hal.Capability{hal.AnalogInput},
-		},
-	}
+    tempC:     refTempC,
+    tempValid: false,
 
-	d.pins = []*rtPin{
-		{parent: d, ch: 0}, // uS
-		{parent: d, ch: 1}, // ppt
-	}
+    debug: debug,
+    meta:  f.meta,
+  }
 
-	log.Printf("robotank_cond init addr=%d AbsD_Fresh=%.3f AbsD_Std=%.3f RefUS=%.1f(fixed) DoTC=%v TempC=%.2f(init) RefTempC=%.2f Alpha=%.4f(fixed) Delay=%v Debug=%v",
-		d.addr, d.absDFresh, d.absDStd, d.refUS, d.doTempComp, d.tempC, d.refTempC, d.alphaPerC, d.delay, d.debug)
+  d.pins = []*rtPin{
+    {parent: d, ch: 0},
+    {parent: d, ch: 1},
+  }
 
-	return d, nil
+  log.Printf(
+    "robotank_cond init addr=%d AbsD_RODI=%.3f AbsD_Std=%.3f RefUS=%.1f(fixed) RefTempC=%.2f(fixed) Alpha=%.6f(config) TempValid=%v TempC=%.2f(init) Delay=%v Debug=%v",
+    d.addr, d.absDFresh, d.absDStd, d.refUS, d.refTempC, d.alphaPerC, d.tempValid, d.tempC, d.delay, d.debug,
+  )
+
+  return d, nil
 }
+
 
 // ----------------- helpers -----------------
 
+// normKey makes lookups resilient to "AbsD_RODI" vs "Absd_rodi" vs "absd-rodi" etc.
+func normKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "_", "")
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
+
+// getAny matches keys case-insensitively and ignoring _ - spaces.
 func getAny(m map[string]interface{}, keys ...string) (interface{}, bool) {
+	if len(m) == 0 {
+		return nil, false
+	}
+
+	// Build normalized index once per call (cheap: maps are small)
+	idx := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		idx[normKey(k)] = v
+	}
+
 	for _, k := range keys {
-		if v, ok := m[k]; ok {
+		if v, ok := idx[normKey(k)]; ok {
 			return unwrapValue(v), true
 		}
 	}
@@ -208,7 +240,6 @@ func getIntAny(m map[string]interface{}, def int, keys ...string) int {
 	if i, ok := toInt(v); ok {
 		return i
 	}
-	// tolerate floats-as-ints
 	if f, ok := toFloat(v); ok {
 		return int(f)
 	}
@@ -321,4 +352,41 @@ func unwrapValue(v interface{}) interface{} {
 		}
 	}
 	return v
+}
+
+
+func (f *factory) defaultFloatParam(name string, fallback float64) float64 {
+	for _, p := range f.parameters {
+		if normKey(p.Name) == normKey(name) {
+			if fv, ok := toFloat(p.Default); ok {
+				return fv
+			}
+		}
+	}
+	return fallback
+}
+
+func (f *factory) defaultIntParam(name string, fallback int) int {
+	for _, p := range f.parameters {
+		if normKey(p.Name) == normKey(name) {
+			if iv, ok := toInt(p.Default); ok {
+				return iv
+			}
+			if fv, ok := toFloat(p.Default); ok {
+				return int(fv)
+			}
+		}
+	}
+	return fallback
+}
+
+func (f *factory) defaultBoolParam(name string, fallback bool) bool {
+	for _, p := range f.parameters {
+		if normKey(p.Name) == normKey(name) {
+			if bv, ok := toBool(p.Default); ok {
+				return bv
+			}
+		}
+	}
+	return fallback
 }
