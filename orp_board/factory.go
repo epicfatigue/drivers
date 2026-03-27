@@ -1,4 +1,4 @@
-package ph_board
+package orp_board
 
 import (
 	"encoding/json"
@@ -18,14 +18,9 @@ type factory struct {
 }
 
 const (
-	addressParam       = "Address"
-	obs7mVParam        = "Obs7_mV"
-	obs4mVParam        = "Obs4_mV"
-	obs10mVParam       = "Obs10_mV"
-	slopeOverrideParam = "Slope_mV_pH"
-	refTempCParam      = "RefTempC"
-	doTempCompParam    = "DoTempComp"
-	debugParam         = "Debug"
+	addressParam     = "Address"
+	calibrationParam = "Calibration_mV"
+	debugParam       = "Debug"
 )
 
 var f *factory
@@ -36,7 +31,7 @@ func Factory() hal.DriverFactory {
 		f = &factory{
 			meta: hal.Metadata{
 				Name:        driverName,
-				Description: "PH Board I2C pH module: reads electrode mV over I2C ADC commands, converts to pH using 0/1/2/3-point calibration. Set any anchor to -1 to disable it. ADC Vref is fixed at 2.048V.",
+				Description: "I2C ORP module: reads electrode millivolts over I2C ADC commands.",
 				Capabilities: []hal.Capability{
 					hal.AnalogInput,
 				},
@@ -47,49 +42,21 @@ func Factory() hal.DriverFactory {
 					Type:        hal.Integer,
 					Order:       0,
 					Default:     0x45,
-					Description: "I²C 7-bit address of the I2C pH board.",
+					Description: "I²C 7-bit address of the I2C ORP board.",
 				},
 				{
-					Name:        obs7mVParam,
+					Name:        calibrationParam,
 					Type:        hal.Decimal,
 					Order:       1,
-					Default:     -1.0,
-					Description: "Observed electrode millivolts in pH 7.00 calibration solution. Set to -1 to disable.",
-				},
-				{
-					Name:        obs4mVParam,
-					Type:        hal.Decimal,
-					Order:       2,
-					Default:     -1.0,
-					Description: "Observed electrode millivolts in pH 4.00 calibration solution. Set to -1 to disable.",
-				},
-				{
-					Name:        obs10mVParam,
-					Type:        hal.Decimal,
-					Order:       3,
-					Default:     -1.0,
-					Description: "Observed electrode millivolts in pH 10.00 calibration solution. Set to -1 to disable.",
-				},
-				{
-					Name:        slopeOverrideParam,
-					Type:        hal.Decimal,
-					Order:       4,
 					Default:     0.0,
-					Description: "Optional manual slope override in millivolts per pH for the ideal model. Use 0 to use the default ideal slope.",
-				},
-				{
-					Name:        doTempCompParam,
-					Type:        hal.Boolean,
-					Order:       5,
-					Default:     false,
-					Description: "Enable temperature compensation for the ideal model (0-point / 1-point modes).",
+					Description: "Observed ORP mV when probe is placed in a 256 mV calibration solution. Enter the measured value. Leave 0 to disable correction.",
 				},
 				{
 					Name:        debugParam,
 					Type:        hal.Boolean,
-					Order:       6,
+					Order:       2,
 					Default:     false,
-					Description: "Enable verbose debug logging for raw ADC and conversion values.",
+					Description: "Enable verbose debug logging for raw ADC and ORP millivolt values.",
 				},
 			},
 		}
@@ -103,7 +70,7 @@ func (f *factory) GetParameters() []hal.ConfigParameter { return f.parameters }
 func (f *factory) ValidateParameters(parameters map[string]interface{}) (bool, map[string][]string) {
 	failures := make(map[string][]string)
 
-	addrRaw, ok := getAny(parameters, addressParam, "Address", "address")
+	addrRaw, ok := getAny(parameters, addressParam, "address")
 	if !ok {
 		failures[addressParam] = append(failures[addressParam], "Address parameter is required")
 	} else {
@@ -115,25 +82,6 @@ func (f *factory) ValidateParameters(parameters map[string]interface{}) (bool, m
 		}
 	}
 
-	_ = getFloatAny(parameters, -1.0,
-		obs7mVParam, "Obs7_mv", "obs7_mv", "ph7_mv")
-	_ = getFloatAny(parameters, -1.0,
-		obs4mVParam, "Obs4_mv", "obs4_mv", "ph4_mv")
-	_ = getFloatAny(parameters, -1.0,
-		obs10mVParam, "Obs10_mv", "obs10_mv", "ph10_mv")
-
-	_ = getFloatAny(parameters, 0.0,
-		slopeOverrideParam, "Slope_mv_ph", "slope_mv_ph", "slope")
-
-	_ = getFloatAny(parameters, 25.0,
-		refTempCParam, "RefTempC", "reftempc", "ref_temp_c")
-
-	_ = getBoolAny(parameters, false,
-		doTempCompParam, "Dotempcomp", "dotempcomp", "dotc")
-
-	_ = getBoolAny(parameters, false,
-		debugParam, "Debug", "debug")
-
 	return len(failures) == 0, failures
 }
 
@@ -142,56 +90,35 @@ func (f *factory) NewDriver(parameters map[string]interface{}, hardwareResources
 		return nil, errors.New(hal.ToErrorString(failures))
 	}
 
-	debug := getBoolAny(parameters, false, debugParam, "Debug", "debug")
+	debug := getBoolAny(parameters, false, debugParam, "debug")
 
 	if debug {
 		if b, err := json.MarshalIndent(parameters, "", "  "); err == nil {
-			log.Printf("pHboard_driver NewDriver raw parameters:\n%s", string(b))
+			log.Printf("orp_board_driver NewDriver raw parameters:\n%s", string(b))
 		}
 	}
 
-	addrInt := getIntAny(parameters, 64, addressParam, "Address", "address")
+	addrInt := getIntAny(parameters, 0x45, addressParam, "address")
+	calibrationMV := getFloatAny(parameters, 0.0, calibrationParam, "calibration_mv", "orp_calibration_mv", "reference_mv")
 
-	obs7 := getFloatAny(parameters, -1.0,
-		obs7mVParam, "Obs7_mv", "obs7_mv", "ph7_mv")
-	obs4 := getFloatAny(parameters, -1.0,
-		obs4mVParam, "Obs4_mv", "obs4_mv", "ph4_mv")
-	obs10 := getFloatAny(parameters, -1.0,
-		obs10mVParam, "Obs10_mv", "obs10_mv", "ph10_mv")
-
-	slopeOverride := getFloatAny(parameters, 0.0,
-		slopeOverrideParam, "Slope_mv_ph", "slope_mv_ph", "slope")
-
-	refTempC := getFloatAny(parameters, 25.0,
-		refTempCParam, "RefTempC", "reftempc", "ref_temp_c")
-
-	doTempComp := getBoolAny(parameters, false,
-		doTempCompParam, "Dotempcomp", "dotempcomp", "dotc")
-
-	d := &phDriver{
+	d := &orpDriver{
 		addr:          byte(addrInt),
 		bus:           hardwareResources.(i2c.Bus),
-		vrefV:         fixedVrefV,
-		obs7mV:        obs7,
-		obs4mV:        obs4,
-		obs10mV:       obs10,
-		slopeOverride: slopeOverride,
-		refTempC:      refTempC,
-		doTempComp:    doTempComp,
-		tempC:         refTempC,
+		vrefV:         2.048, // ADS1119 internal reference
+		calibrationMV: calibrationMV,
 		debug:         debug,
 		meta: hal.Metadata{
 			Name:         driverName,
-			Description:  "I2C pH module: electrode mV → pH via 0/1/2/3-point calibration (Vref fixed at 2.048V)",
+			Description:  "I2C ORP module: electrode mV",
 			Capabilities: []hal.Capability{hal.AnalogInput},
 		},
 	}
 
-	d.pins = []*phPin{{parent: d, ch: 0}}
+	d.pins = []*orpPin{{parent: d, ch: 0}}
 
 	if debug {
-		log.Printf("pHboard_driver init addr=%d (0x%02X) Vref=%.3f Obs7=%.2f Obs4=%.2f Obs10=%.2f slope_override=%.4f DoTC=%v RefTempC=%.2f tempC(init)=%.2f",
-			addrInt, addrInt, fixedVrefV, obs7, obs4, obs10, slopeOverride, doTempComp, refTempC, d.tempC)
+		log.Printf("orp_board_driver init addr=%d (0x%02X) vref=%.3f calibrationMV=%.2f",
+			addrInt, addrInt, d.vrefV, d.calibrationMV)
 	}
 
 	if err := d.initADC(); err != nil {

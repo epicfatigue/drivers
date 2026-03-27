@@ -68,21 +68,52 @@ func Factory() hal.DriverFactory {
 	once.Do(func() {
 		f = &factory{
 			meta: hal.Metadata{
-				Name:         driverName,
-				Description:  "Robo-Tank pH circuit (I2C ASCII protocol: H/R). Software trim via Obs4/Obs7/Obs10.",
-				Capabilities: []hal.Capability{hal.AnalogInput},
+				Name:        driverName,
+				Description: "Robo-Tank pH circuit (I2C ASCII protocol: H/R). Uses observed mV anchors at pH 4, 7, and 10 for software calibration.",
+				Capabilities: []hal.Capability{
+					hal.AnalogInput,
+				},
 			},
 			parameters: []hal.ConfigParameter{
-				// Basic runtime diagnostics
-				{Name: debugParam, Type: hal.Boolean, Order: 0, Default: false},
+				// Address
+				{
+					Name:        addressParam,
+					Type:        hal.Integer,
+					Order:       0,
+					Default:     0x62,
+					Description: "I²C 7-bit address of the Robo-Tank pH circuit (typically 0x62).",
+				},
 
-				// I2C address (defaults to Robo-Tank typical address)
-				{Name: addressParam, Type: hal.Integer, Order: 1, Default: 0x62},
-
-				// -1 means disabled (no anchor)
-				{Name: obs4Param, Type: hal.Decimal, Order: 2, Default: -1.0},
-				{Name: obs7Param, Type: hal.Decimal, Order: 3, Default: -1.0},
-				{Name: obs10Param, Type: hal.Decimal, Order: 4, Default: -1.0},
+				// Calibration anchors
+				{
+					Name:        obs4Param,
+					Type:        hal.Decimal,
+					Order:       1,
+					Default:     -1.0,
+					Description: "Observed electrode mV when probe is placed in pH 4.00 calibration solution. Set to -1 to disable this calibration point.",
+				},
+				{
+					Name:        obs7Param,
+					Type:        hal.Decimal,
+					Order:       2,
+					Default:     -1.0,
+					Description: "Observed electrode mV when probe is placed in pH 7.00 calibration solution. Set to -1 to disable this calibration point.",
+				},
+				{
+					Name:        obs10Param,
+					Type:        hal.Decimal,
+					Order:       3,
+					Default:     -1.0,
+					Description: "Observed electrode mV when probe is placed in pH 10.00 calibration solution. Set to -1 to disable this calibration point.",
+				},
+				// Debug
+				{
+					Name:        debugParam,
+					Type:        hal.Boolean,
+					Order:       4,
+					Default:     false,
+					Description: "Enable verbose debug logging including raw I2C responses, calculated millivolts, slope, and final pH values.",
+				},
 			},
 		}
 	})
